@@ -8,6 +8,8 @@
 - release-preparation base: `0bd5dde4da3b92be8a41fa9a98990aafe17b665b`
 - **frozen provider checkpoint:**
   `beabf36a299572607232806807ad9b9c2d4cb222`
+- post-RC synchronized security checkpoint:
+  `5d5cbe16dd2da2e58365b311d99b87e87598c09f`
 - preflight-validated head:
   `d7b772cbb4dbd00a79a1a9af0d5fd9f10e8e9c5f`
 - extraction started from observation head:
@@ -38,6 +40,17 @@ The provider files receive only deterministic extraction transformations:
 The consumer-neutral `contract` package and JSON CLI are new adapters outside
 the provider core. They translate `consumerId` to the legacy schema-2 `runId`
 without changing the broker wire representation.
+
+## Post-RC synchronized security fix
+
+The frozen checkpoint and `codex/release-v0.13.0-rc.1` remain unchanged. The
+post-RC checkpoint is a one-commit follow-up on a separate TestPlay branch. It
+passes the already-durable installed-user SID into writable parent, child, and
+recovery attaches so `AttachVirtualDisk` does not inherit the LocalSystem-owned
+VHDX file DACL. Public protocol schemas, journal fields, cleanup, quarantine,
+and recovery state transitions are unchanged. The extracted provider carries
+the package-renamed form of that same patch and its opt-in non-elevated VHDX
+write-access regression test.
 
 ## Deliberately preserved compatibility identifiers
 
@@ -72,6 +85,7 @@ observation gate, with its own parity evidence.
 Run both suites from the source checkout:
 
 ```powershell
+git switch --detach 5d5cbe16dd2da2e58365b311d99b87e87598c09f
 go test ./internal/vhdxworkspace ./internal/vhdxstorage -count=1
 Push-Location .\unity-workspace-storage
 go test ./... -count=1
@@ -102,3 +116,15 @@ from `testplay-runner/docs/differencing-vhdx-workspace-provider.md` and
 These are static/local Windows checks. No privileged native VHDX evidence was
 rerun because provider bytes are checkpoint-derived and this extraction does
 not claim a new native result.
+
+### Observed post-RC security checks (2026-08-14)
+
+| Check | Result |
+|---|---|
+| original `codex/release-v0.13.0-rc.1` head | UNCHANGED — fix is on a separate follow-up branch |
+| synchronized checkpoint parity | PASS — all 43 mapped source/test blobs |
+| TestPlay full tests / vet | PASS |
+| extracted full tests / vet | PASS |
+| changed-package race detectors | PASS in both repositories |
+| opt-in non-elevated installed-user VHDX write/read/delete/abort | PASS, residual counts unchanged |
+| HoneyBee OpenCode → Unity → TestPlay transaction | PASS, source unchanged and child residual 0 |

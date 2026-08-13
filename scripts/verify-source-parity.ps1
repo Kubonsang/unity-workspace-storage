@@ -4,7 +4,7 @@ param(
     [string]$SourceRoot = (Join-Path $PSScriptRoot '..\..'),
 
     [Parameter()]
-    [string]$Checkpoint = 'beabf36a299572607232806807ad9b9c2d4cb222'
+    [string]$Checkpoint = '5d5cbe16dd2da2e58365b311d99b87e87598c09f'
 )
 
 Set-StrictMode -Version Latest
