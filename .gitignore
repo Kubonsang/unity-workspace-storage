@@ -1,0 +1,5 @@
+/unity-workspace-storage
+/unity-workspace-storage.exe
+*.test
+*.out
+coverage.txt
