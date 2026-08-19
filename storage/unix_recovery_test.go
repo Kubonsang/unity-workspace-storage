@@ -10,6 +10,7 @@ import (
 )
 
 func TestUnixLeaseSnapshotRecoversExactOwnedLease(t *testing.T) {
+	requireNativeCoWTest(t)
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
 	children := filepath.Join(root, "children")
@@ -24,7 +25,7 @@ func TestUnixLeaseSnapshotRecoversExactOwnedLease(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(parent, "value"), []byte("parent"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	lease, _, err := NewBackend().Acquire(context.Background(), AcquireRequest{ParentPath: parent, ChildPath: child, MountPath: mount, StoreRoot: children, LeaseID: "lease-recovery"}, nil)
+	lease, _, err := NewDaemonBackend().Acquire(context.Background(), AcquireRequest{ParentPath: parent, ChildPath: child, MountPath: mount, StoreRoot: children, LeaseID: "lease-recovery"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +46,7 @@ func TestUnixLeaseSnapshotRecoversExactOwnedLease(t *testing.T) {
 }
 
 func TestUnixLeaseRecoveryRefusesReplacedMount(t *testing.T) {
+	requireNativeCoWTest(t)
 	root := t.TempDir()
 	parent := filepath.Join(root, "parent")
 	children := filepath.Join(root, "children")
@@ -53,7 +55,7 @@ func TestUnixLeaseRecoveryRefusesReplacedMount(t *testing.T) {
 	_ = os.MkdirAll(parent, 0700)
 	_ = os.MkdirAll(children, 0700)
 	_ = os.WriteFile(filepath.Join(parent, "value"), []byte("parent"), 0600)
-	lease, _, err := NewBackend().Acquire(context.Background(), AcquireRequest{ParentPath: parent, ChildPath: child, MountPath: mount, StoreRoot: children, LeaseID: "lease-mount"}, nil)
+	lease, _, err := NewDaemonBackend().Acquire(context.Background(), AcquireRequest{ParentPath: parent, ChildPath: child, MountPath: mount, StoreRoot: children, LeaseID: "lease-mount"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,5 +68,12 @@ func TestUnixLeaseRecoveryRefusesReplacedMount(t *testing.T) {
 	}
 	if _, err := RecoverUnixLease(snapshot); err == nil {
 		t.Fatal("replaced mount accepted")
+	}
+}
+
+func requireNativeCoWTest(t *testing.T) {
+	t.Helper()
+	if os.Getenv("UNITY_WORKSPACE_STORAGE_NATIVE_TEST") != "1" {
+		t.Skip("native lifecycle runs in the platform capability job")
 	}
 }

@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -18,11 +19,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.23.x'
           cache: true
       - run: go test ./... -count=1
+        env:
+          TMPDIR: ${{ matrix.os == 'macos-latest' && '/private/tmp' || '' }}
       - run: go vet ./...
       - run: go test -race ./... -count=1
+        env:
+          TMPDIR: ${{ matrix.os == 'macos-latest' && '/private/tmp' || '' }}
 
   linux-native-reflink:
     runs-on: ubuntu-latest
@@ -30,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.23.x'
           cache: true
       - name: Create reflink-enabled XFS
         run: |
@@ -44,4 +49,19 @@ jobs:
       - name: Native reflink lifecycle and restart recovery
         env:
           TMPDIR: /mnt/unity-workspace-storage
+          UNITY_WORKSPACE_STORAGE_NATIVE_TEST: '1'
+        run: go test ./storage ./internal/workspaced -count=1
+
+  macos-native-apfs:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - name: Native APFS lifecycle and restart recovery
+        env:
+          TMPDIR: /private/tmp
+          UNITY_WORKSPACE_STORAGE_NATIVE_TEST: '1'
         run: go test ./storage ./internal/workspaced -count=1

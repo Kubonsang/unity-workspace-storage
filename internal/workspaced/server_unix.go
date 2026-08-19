@@ -29,7 +29,7 @@ func DefaultSocketPath() string {
 	if err == nil {
 		return filepath.Join(cache, "unity-workspace-storage", "daemon.sock")
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("unity-workspace-storage-%d.sock", os.Getuid()))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("unity-workspace-storage-%d", os.Getuid()), "daemon.sock")
 }
 
 type SocketClient struct{ Path string }
@@ -62,15 +62,14 @@ func (c SocketClient) Call(ctx context.Context, request v2.Request) (v2.Response
 }
 
 func Serve(ctx context.Context, config Config) error {
-	manager, err := NewManager(ctx, config, storage.NewBackend())
-	if err != nil {
+	if err := config.Validate(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(config.SocketPath), 0700); err != nil {
+	if err := os.MkdirAll(config.StoreRoot, 0700); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(filepath.Dir(config.SocketPath)); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("socket directory must be a real directory")
+	if info, err := os.Lstat(config.StoreRoot); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("store root must be a real directory")
 	}
 	lock, err := os.OpenFile(filepath.Join(config.StoreRoot, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -81,6 +80,31 @@ func Serve(ctx context.Context, config Config) error {
 		return fmt.Errorf("another daemon owns the store: %w", err)
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	manager, err := NewManager(ctx, config, storage.NewDaemonBackend())
+	if err != nil {
+		return err
+	}
+	socketDirectory := filepath.Dir(config.SocketPath)
+	_, directoryErr := os.Lstat(socketDirectory)
+	directoryCreated := os.IsNotExist(directoryErr)
+	if directoryErr != nil && !directoryCreated {
+		return directoryErr
+	}
+	if err := os.MkdirAll(socketDirectory, 0700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(socketDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("socket directory must be a real directory")
+	}
+	if info.Mode().Perm() != 0700 {
+		if !directoryCreated {
+			return fmt.Errorf("existing socket directory mode must be 0700")
+		}
+		if err := os.Chmod(socketDirectory, 0700); err != nil {
+			return err
+		}
+	}
 	if _, err := os.Lstat(config.SocketPath); err == nil {
 		probe, probeErr := net.DialTimeout("unix", config.SocketPath, 250*time.Millisecond)
 		if probeErr == nil {

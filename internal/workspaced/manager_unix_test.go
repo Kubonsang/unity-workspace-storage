@@ -103,6 +103,11 @@ func TestManagerParentAcquireStatusRelease(t *testing.T) {
 	if repeated := manager.Handle(ctx, acquire); repeated.Lease == nil || repeated.Lease.LeaseID != acquired.Lease.LeaseID {
 		t.Fatalf("idempotency changed: %#v", repeated)
 	}
+	conflict := acquire
+	conflict.ParentID = "parent-different"
+	if duplicate := manager.Handle(ctx, conflict); duplicate.Error == nil || duplicate.Error.Code != "duplicate-request-id" {
+		t.Fatalf("duplicate requestId response=%#v", duplicate)
+	}
 	status := manager.Handle(ctx, request(v2.OperationStatus, "status-1"))
 	if !status.OK || status.Status == nil || status.Status.ParentCount != 1 || status.Status.ActiveLeaseCount != 1 {
 		t.Fatalf("status=%#v", status)
@@ -186,9 +191,10 @@ func TestManagerFailClosedOnUnrecoverableLease(t *testing.T) {
 }
 
 func TestNativeManagerRestartRecoversLiveLease(t *testing.T) {
+	requireNativeCoWTest(t)
 	ctx := context.Background()
 	config := testConfig(t)
-	first, err := NewManager(ctx, config, storage.NewBackend())
+	first, err := NewManager(ctx, config, storage.NewDaemonBackend())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +226,7 @@ func TestNativeManagerRestartRecoversLiveLease(t *testing.T) {
 	if !acquired.OK {
 		t.Fatal(acquired.Error)
 	}
-	second, err := NewManager(ctx, config, storage.NewBackend())
+	second, err := NewManager(ctx, config, storage.NewDaemonBackend())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,9 +241,10 @@ func TestNativeManagerRestartRecoversLiveLease(t *testing.T) {
 }
 
 func TestNativeManagerRestartCleansDeadClientLease(t *testing.T) {
+	requireNativeCoWTest(t)
 	ctx := context.Background()
 	config := testConfig(t)
-	first, err := NewManager(ctx, config, storage.NewBackend())
+	first, err := NewManager(ctx, config, storage.NewDaemonBackend())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,12 +269,19 @@ func TestNativeManagerRestartCleansDeadClientLease(t *testing.T) {
 	if !acquired.OK {
 		t.Fatal(acquired.Error)
 	}
-	second, err := NewManager(ctx, config, storage.NewBackend())
+	second, err := NewManager(ctx, config, storage.NewDaemonBackend())
 	if err != nil {
 		t.Fatal(err)
 	}
 	status := second.measureStatus()
 	if status.ActiveLeaseCount != 0 {
 		t.Fatalf("dead lease remains: %#v", status)
+	}
+}
+
+func requireNativeCoWTest(t *testing.T) {
+	t.Helper()
+	if os.Getenv("UNITY_WORKSPACE_STORAGE_NATIVE_TEST") != "1" {
+		t.Skip("native lifecycle runs in the platform capability job")
 	}
 }

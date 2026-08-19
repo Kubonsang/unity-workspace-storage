@@ -112,3 +112,12 @@ The parity verifier continues to require all 42 mapped schema-1/provider files
 to match the original checkpoint exactly. Windows schema 1 remains the RC
 compatibility boundary; schema 2 adapters and Unix native evidence carry their
 own tests and CI history.
+
+The schema-2 daemon selects the additive `storage.NewDaemonBackend`. On Linux
+it delegates to the frozen reflink implementation. On macOS its additive
+adapter preserves the frozen `clonefileat` tree walk while allowing absolute
+paths that traverse system-owned aliases such as `/var -> /private/var`;
+source-tree symlinks and special files remain rejected before cloning. The
+checkpoint-derived `storage/clone_darwin.go` is unchanged. Native CI separately
+requires two-child isolation, allocated-byte evidence, clean release, and
+daemon restart recovery on APFS and reflink-enabled XFS.

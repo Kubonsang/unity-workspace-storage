@@ -77,6 +77,8 @@ func (c Config) Validate() error {
 type parentRecord struct {
 	v2.Parent
 	DataPath string `json:"dataPath"`
+	Device   uint64 `json:"device"`
+	Inode    uint64 `json:"inode"`
 }
 
 type pendingRecord struct {
@@ -112,10 +114,15 @@ type Manager struct {
 	bootID         string
 	capability     v2.Capability
 	leases         map[string]storage.Lease
-	requests       map[string]v2.Response
+	requests       map[string]requestRecord
 	manualRecovery bool
 	snapshotLease  func(storage.Lease) (storage.UnixLeaseSnapshot, error)
 	recoverLease   func(storage.UnixLeaseSnapshot) (storage.Lease, error)
+}
+
+type requestRecord struct {
+	Request  v2.Request
+	Response v2.Response
 }
 
 func NewManager(ctx context.Context, config Config, backend storage.Backend) (*Manager, error) {
@@ -133,7 +140,7 @@ func NewManager(ctx context.Context, config Config, backend storage.Backend) (*M
 			return nil, fmt.Errorf("unsafe real directory required: %s", path)
 		}
 	}
-	m := &Manager{config: config, backend: backend, bootID: platformBootID(), leases: map[string]storage.Lease{}, requests: map[string]v2.Response{}, snapshotLease: storage.SnapshotUnixLease, recoverLease: storage.RecoverUnixLease}
+	m := &Manager{config: config, backend: backend, bootID: platformBootID(), leases: map[string]storage.Lease{}, requests: map[string]requestRecord{}, snapshotLease: storage.SnapshotUnixLease, recoverLease: storage.RecoverUnixLease}
 	m.capability = v2.Capability{Platform: runtime.GOOS, Provider: backend.Provider(), ArtifactKind: "directory", RequiresElevation: false, Transport: "unix-socket"}
 	if err := m.probe(ctx); err != nil {
 		m.capability.Error = err.Error()
@@ -150,11 +157,14 @@ func (m *Manager) Handle(ctx context.Context, request v2.Request) v2.Response {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if prior, ok := m.requests[request.RequestID]; ok {
-		return prior
+		if prior.Request != request {
+			return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: false, Provider: m.backend.Provider(), Error: &v2.Error{Code: "duplicate-request-id", Operation: request.Operation, Message: "requestId was already used with a different payload"}}
+		}
+		return prior.Response
 	}
 	response := m.handle(ctx, request)
 	if request.RequestID != "" {
-		m.requests[request.RequestID] = response
+		m.requests[request.RequestID] = requestRecord{Request: request, Response: response}
 	}
 	return response
 }
@@ -241,7 +251,11 @@ func (m *Manager) parentCommit(request v2.Request, fail failFunc) v2.Response {
 	if err := os.Rename(pending.StagingPath, dataPath); err != nil {
 		return fail("parent-commit-failed", err)
 	}
-	parent := parentRecord{Parent: v2.Parent{ParentID: parentID, Compatibility: pending.CompatibilityKey, Provider: m.backend.Provider(), ArtifactKind: "directory", ContentDigest: digest, LogicalBytes: logical, AllocatedBytes: usage.AllocatedBytes, Immutable: true, CreatedAt: time.Now().UTC()}, DataPath: dataPath}
+	device, inode, err := directoryIdentity(dataPath)
+	if err != nil {
+		return fail("parent-commit-failed", err)
+	}
+	parent := parentRecord{Parent: v2.Parent{ParentID: parentID, Compatibility: pending.CompatibilityKey, Provider: m.backend.Provider(), ArtifactKind: "directory", ContentDigest: digest, LogicalBytes: logical, AllocatedBytes: usage.AllocatedBytes, Immutable: true, CreatedAt: time.Now().UTC()}, DataPath: dataPath, Device: device, Inode: inode}
 	if err := writeJSON(filepath.Join(parentDir, "metadata.json"), parent); err != nil {
 		return fail("parent-commit-failed", err)
 	}
@@ -456,11 +470,11 @@ func (m *Manager) recover(ctx context.Context) error {
 			m.leases[journal.LeaseID] = lease
 			continue
 		}
-		if _, err := lease.Release(ctx, true, nil); err != nil {
+		if err := validateWorkspaceOwner(&journal); err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
-		if err := validateWorkspaceOwner(&journal); err != nil {
+		if _, err := lease.Release(ctx, true, nil); err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
@@ -509,6 +523,13 @@ func (m *Manager) readLease(id string) (*leaseJournal, error) {
 }
 
 func verifyParent(parent parentRecord) error {
+	device, inode, err := directoryIdentity(parent.DataPath)
+	if err != nil {
+		return err
+	}
+	if device != parent.Device || inode != parent.Inode {
+		return errors.New("committed parent identity changed")
+	}
 	digest, logical, err := digestTree(parent.DataPath)
 	if err != nil {
 		return err
@@ -517,6 +538,21 @@ func verifyParent(parent parentRecord) error {
 		return errors.New("committed parent content changed")
 	}
 	return nil
+}
+
+func directoryIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, 0, errors.New("parent data path is not a real directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, errors.New("parent filesystem identity is unavailable")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 func validateWorkspace(root, path, mount string) error {
 	if !pathWithin(root, path) {

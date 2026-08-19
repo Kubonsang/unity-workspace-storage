@@ -5,6 +5,8 @@ package workspaced
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,12 @@ import (
 
 func TestUnixSocketServerAuthenticatesCurrentUserAndServesStatus(t *testing.T) {
 	config := testConfig(t)
+	shortRuntime, err := os.MkdirTemp("/tmp", "uws-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortRuntime) })
+	config.SocketPath = filepath.Join(shortRuntime, "daemon.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -21,6 +29,11 @@ func TestUnixSocketServerAuthenticatesCurrentUserAndServesStatus(t *testing.T) {
 	for {
 		if _, err := os.Lstat(config.SocketPath); err == nil {
 			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("server stopped before creating socket: %v", err)
+		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("socket was not created")
@@ -40,6 +53,9 @@ func TestUnixSocketServerAuthenticatesCurrentUserAndServesStatus(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("socket mode=%o", info.Mode().Perm())
+	}
+	if err := Serve(context.Background(), config); err == nil || !strings.Contains(err.Error(), "another daemon owns the store") {
+		t.Fatalf("second daemon did not fail the store lock: %v", err)
 	}
 	cancel()
 	select {

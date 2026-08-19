@@ -46,8 +46,9 @@ unity-workspace-storage workspace release --schema 2 --lease-id lease-...
 ```
 
 The producer chooses the compatibility key. The daemon computes and records the
-actual committed content digest, revalidates it before every acquire, and uses
-an opaque provider-specific parent ID for consumers.
+actual committed content digest plus filesystem device/inode identity,
+revalidates both before every acquire, and uses an opaque provider-specific
+parent ID for consumers. Replaced or modified parents are quarantined.
 
 Example acquire request:
 
