@@ -102,3 +102,13 @@ from `testplay-runner/docs/differencing-vhdx-workspace-provider.md` and
 These are static/local Windows checks. No privileged native VHDX evidence was
 rerun because provider bytes are checkpoint-derived and this extraction does
 not claim a new native result.
+
+## Post-extraction schema 2 development
+
+Provider-neutral schema 2, the Unix user daemon, and durable Unix lease
+recovery are additive files developed after the frozen extraction. They are
+not represented as checkpoint-derived source in `provenance/source-map.tsv`.
+The parity verifier continues to require all 42 mapped schema-1/provider files
+to match the original checkpoint exactly. Windows schema 1 remains the RC
+compatibility boundary; schema 2 adapters and Unix native evidence carry their
+own tests and CI history.

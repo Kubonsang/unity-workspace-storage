@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"github.com/Kubonsang/unity-workspace-storage/contract"
+	v2 "github.com/Kubonsang/unity-workspace-storage/contract/v2"
 )
 
 type lifecycle interface {
@@ -31,12 +34,144 @@ type cliErrorBody struct {
 }
 
 func main() {
-	operation, result, err := execute(context.Background(), os.Args[1:], os.Stdin, contract.Default())
+	operation, result, err := executeTop(context.Background(), os.Args[1:], os.Stdin, contract.Default(), v2.New(defaultV2Client()))
 	if err != nil {
 		writeJSON(os.Stdout, cliError{SchemaVersion: contract.SchemaVersion, OK: false, Operation: operation, Error: cliErrorBody{Code: "workspace-command-failed", Message: err.Error()}})
 		os.Exit(1)
 	}
 	writeJSON(os.Stdout, result)
+}
+
+func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy lifecycle, modern v2.Service) (string, any, error) {
+	if len(args) > 0 && args[0] == "serve" {
+		return "serve", nil, platformServe(ctx, args[1:])
+	}
+	if len(args) > 0 && args[0] == "parent" {
+		return executeParentV2(ctx, args[1:], modern)
+	}
+	if len(args) >= 2 && args[0] == "workspace" {
+		schema := 1
+		for i := 2; i+1 < len(args); i++ {
+			if args[i] == "--schema" {
+				value, err := strconv.Atoi(args[i+1])
+				if err != nil {
+					return args[1], nil, err
+				}
+				schema = value
+				args = append(args[:i], args[i+2:]...)
+				break
+			}
+		}
+		if args[1] == "acquire" {
+			data, err := readRequestData(args[2:], stdin)
+			if err != nil {
+				return "acquire", nil, err
+			}
+			var header struct {
+				SchemaVersion int `json:"schemaVersion"`
+			}
+			if err := json.Unmarshal(data, &header); err != nil {
+				return "acquire", nil, err
+			}
+			schema = header.SchemaVersion
+			if schema == 2 {
+				var request v2.Request
+				if err := decodeBytes(data, &request); err != nil {
+					return "acquire", nil, err
+				}
+				if request.Operation != "" && request.Operation != v2.OperationAcquire {
+					return "acquire", nil, errors.New("request operation must be workspace-acquire")
+				}
+				response, err := modern.Acquire(ctx, v2.AcquireRequest{RequestID: request.RequestID, ConsumerID: request.ConsumerID, WorkspaceID: request.WorkspaceID, ParentID: request.ParentID, ClientPID: request.ClientPID, Limits: request.Limits})
+				return "acquire", response, err
+			}
+			return execute(ctx, args, bytes.NewReader(data), legacy)
+		}
+		if schema == 2 {
+			return executeWorkspaceV2(ctx, args[1:], modern)
+		}
+	}
+	return execute(ctx, args, stdin, legacy)
+}
+
+func executeParentV2(ctx context.Context, args []string, service v2.Service) (string, any, error) {
+	if len(args) == 0 {
+		return "parent", nil, errors.New("usage: parent begin|commit|abort")
+	}
+	switch args[0] {
+	case "begin":
+		flags := newFlagSet("parent begin")
+		key := flags.String("compatibility-key", "", "64-character producer compatibility digest")
+		requestID := flags.String("request-id", "", "optional idempotency request ID")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *key == "" {
+			return "parent-begin", nil, errors.Join(err, errors.New("parent begin requires --compatibility-key"))
+		}
+		response, err := service.ParentBegin(ctx, v2.ParentBeginRequest{RequestID: *requestID, CompatibilityKey: *key})
+		return "parent-begin", response, err
+	case "commit", "abort":
+		flags := newFlagSet("parent " + args[0])
+		transactionID := flags.String("transaction-id", "", "transaction returned by parent begin")
+		requestID := flags.String("request-id", "", "optional idempotency request ID")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *transactionID == "" {
+			return "parent-" + args[0], nil, errors.Join(err, errors.New("transaction ID is required"))
+		}
+		if args[0] == "commit" {
+			response, err := service.ParentCommit(ctx, v2.ParentCommitRequest{RequestID: *requestID, TransactionID: *transactionID})
+			return "parent-commit", response, err
+		}
+		response, err := service.ParentAbort(ctx, v2.ParentAbortRequest{RequestID: *requestID, TransactionID: *transactionID})
+		return "parent-abort", response, err
+	default:
+		return "parent-" + args[0], nil, fmt.Errorf("unknown parent operation %q", args[0])
+	}
+}
+
+func executeWorkspaceV2(ctx context.Context, args []string, service v2.Service) (string, any, error) {
+	switch args[0] {
+	case "status":
+		flags := newFlagSet("workspace status")
+		requestID := flags.String("request-id", "", "optional idempotency request ID")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+			return "status", nil, err
+		}
+		response, err := service.Status(ctx, v2.StatusRequest{RequestID: *requestID})
+		return "status", response, err
+	case "release":
+		flags := newFlagSet("workspace release")
+		requestID := flags.String("request-id", "", "optional idempotency request ID")
+		leaseID := flags.String("lease-id", "", "lease returned by acquire")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || *leaseID == "" {
+			return "release", nil, errors.Join(err, errors.New("release requires --lease-id"))
+		}
+		response, err := service.Release(ctx, v2.ReleaseRequest{RequestID: *requestID, LeaseID: *leaseID})
+		return "release", response, err
+	default:
+		return args[0], nil, fmt.Errorf("unknown workspace operation %q", args[0])
+	}
+}
+
+func readRequestData(args []string, stdin io.Reader) ([]byte, error) {
+	flags := newFlagSet("workspace acquire")
+	path := flags.String("request", "-", "request JSON path or stdin")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return nil, errors.Join(err, errors.New("acquire accepts only --request"))
+	}
+	if *path == "-" {
+		return io.ReadAll(stdin)
+	}
+	return os.ReadFile(*path)
+}
+func decodeBytes(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("multiple JSON values")
+	}
+	return nil
 }
 
 func execute(ctx context.Context, args []string, stdin io.Reader, service lifecycle) (string, any, error) {
