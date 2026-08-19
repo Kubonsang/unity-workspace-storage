@@ -10,6 +10,7 @@ The first extraction intentionally favors behavioral parity over redesign:
 - `workspace` is the schema-2 broker, immutable-parent store, lease journal,
   quota/GC, crash recovery, and authenticated named-pipe transport.
 - `contract` is the small consumer-neutral `acquire / status / release` API.
+- `contract/v2` is the provider-neutral Windows/macOS/Linux lifecycle API.
 - `cmd/unity-workspace-storage` exposes that contract as JSON for non-Go
   consumers such as HoneyBee.
 
@@ -106,3 +107,15 @@ documented package/import disentangling transformations.
 
 See [PROVENANCE.md](PROVENANCE.md) for the exact checkpoint and deliberate
 compatibility debt.
+
+## macOS and Linux CoW daemon
+
+Schema 2 adds immutable directory parents, APFS clonefile/Linux reflink child
+workspaces, quota reporting, ownership-safe cleanup, and daemon restart
+recovery. The daemon runs as the current user over an authenticated Unix domain
+socket. A filesystem that cannot perform a native CoW clone returns
+`cow-unavailable`; there is no physical-copy fallback.
+
+See [docs/unix-daemon.md](docs/unix-daemon.md) for configuration and the
+parent producer plus workspace consumer flow. Windows schema 1 and its frozen
+named-pipe broker remain unchanged.

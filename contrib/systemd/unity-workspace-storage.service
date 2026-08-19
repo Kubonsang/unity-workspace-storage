@@ -1,0 +1,12 @@
+[Unit]
+Description=Unity Workspace Storage user daemon
+
+[Service]
+Type=simple
+ExecStart=/ABSOLUTE/PATH/unity-workspace-storage serve --config /ABSOLUTE/PATH/config.json
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

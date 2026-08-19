@@ -102,3 +102,29 @@ from `testplay-runner/docs/differencing-vhdx-workspace-provider.md` and
 These are static/local Windows checks. No privileged native VHDX evidence was
 rerun because provider bytes are checkpoint-derived and this extraction does
 not claim a new native result.
+
+## Post-extraction schema 2 development
+
+Provider-neutral schema 2, the Unix user daemon, and durable Unix lease
+recovery are additive files developed after the frozen extraction. They are
+not represented as checkpoint-derived source in `provenance/source-map.tsv`.
+The parity verifier continues to require all 42 mapped schema-1/provider files
+to match the original checkpoint exactly. Windows schema 1 remains the RC
+compatibility boundary; schema 2 adapters and Unix native evidence carry their
+own tests and CI history.
+
+Because CI does not clone the TestPlay source repository, the normalized
+destination hashes for those same 42 mapped files are committed in
+`provenance/frozen-destination-sha256.tsv`. Every Windows matrix job runs
+`scripts/verify-frozen-destination-parity.ps1` immediately after checkout and
+fails if a frozen destination is missing or drifts. The source-aware verifier
+remains the stronger local check when the original repository is available.
+
+The schema-2 daemon selects the additive `storage.NewDaemonBackend`. On Linux
+it delegates to the frozen reflink implementation. On macOS its additive
+adapter preserves the frozen `clonefileat` tree walk while allowing absolute
+paths that traverse system-owned aliases such as `/var -> /private/var`;
+source-tree symlinks and special files remain rejected before cloning. The
+checkpoint-derived `storage/clone_darwin.go` is unchanged. Native CI separately
+requires two-child isolation, allocated-byte evidence, clean release, and
+daemon restart recovery on APFS and reflink-enabled XFS.

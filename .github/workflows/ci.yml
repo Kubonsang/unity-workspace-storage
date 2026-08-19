@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -12,13 +13,64 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify frozen provider parity
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/verify-frozen-destination-parity.ps1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+      - run: go test ./... -count=1
+        env:
+          TMPDIR: ${{ matrix.os == 'macos-15' && '/private/tmp' || '' }}
+      - run: go vet ./...
+      - run: go test -race ./... -count=1
+        env:
+          TMPDIR: ${{ matrix.os == 'macos-15' && '/private/tmp' || '' }}
+      - name: Cross-build macOS targets
+        if: matrix.os == 'macos-15'
+        run: |
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build ./...
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./...
+
+  linux-native-reflink:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
           cache: true
-      - run: go test ./... -count=1
-      - run: go vet ./...
+      - name: Create reflink-enabled XFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs
+          truncate -s 3G /tmp/unity-workspace-storage.xfs
+          sudo mkfs.xfs -f -m reflink=1 /tmp/unity-workspace-storage.xfs
+          sudo mkdir -p /mnt/unity-workspace-storage
+          sudo mount -o loop /tmp/unity-workspace-storage.xfs /mnt/unity-workspace-storage
+          sudo chown "$USER:$USER" /mnt/unity-workspace-storage
+      - name: Native reflink lifecycle and restart recovery
+        env:
+          TMPDIR: /mnt/unity-workspace-storage
+          UNITY_WORKSPACE_STORAGE_NATIVE_TEST: '1'
+        run: go test ./storage ./internal/workspaced -count=1
+
+  macos-native-apfs:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Native APFS lifecycle and restart recovery
+        env:
+          TMPDIR: /private/tmp
+          UNITY_WORKSPACE_STORAGE_NATIVE_TEST: '1'
+        run: go test ./storage ./internal/workspaced -count=1
