@@ -92,6 +92,13 @@ func TestManagerParentAcquireStatusRelease(t *testing.T) {
 	if err := os.MkdirAll(workspace, 0700); err != nil {
 		t.Fatal(err)
 	}
+	projectFile := filepath.Join(workspace, "Assets", "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(projectFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectFile, []byte("producer-owned"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	acquire := request(v2.OperationAcquire, "acquire-1")
 	acquire.ConsumerID = "consumer-1"
 	acquire.WorkspaceID = "ws-1"
@@ -118,8 +125,120 @@ func TestManagerParentAcquireStatusRelease(t *testing.T) {
 	if !released.OK {
 		t.Fatalf("release=%#v", released)
 	}
-	if _, err := os.Lstat(workspace); !os.IsNotExist(err) {
-		t.Fatalf("workspace not removed: %v", err)
+	data, err := os.ReadFile(projectFile)
+	if err != nil || string(data) != "producer-owned" {
+		t.Fatalf("producer workspace was modified: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, workspaceOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("workspace owner marker remains: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, "Library")); !os.IsNotExist(err) {
+		t.Fatalf("Library mount remains: %v", err)
+	}
+}
+
+func TestParentCommitResumesPublicationAndUsesDurableReceipt(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(ctx, testConfig(t), fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin := request(v2.OperationParentBegin, "resume-begin")
+	begin.CompatibilityKey = "abababababababababababababababababababababababababababababababab"
+	begun := manager.Handle(ctx, begin)
+	if !begun.OK {
+		t.Fatal(begun.Error)
+	}
+	if err := os.WriteFile(filepath.Join(begun.StagingPath, "probe"), []byte("resumable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	transactionDir := filepath.Dir(begun.StagingPath)
+	publication := filepath.Join(transactionDir, "publication")
+	if err := os.Mkdir(publication, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(begun.StagingPath, filepath.Join(publication, "data")); err != nil {
+		t.Fatal(err)
+	}
+	commit := request(v2.OperationParentCommit, "resume-commit")
+	commit.TransactionID = begun.TransactionID
+	committed := manager.Handle(ctx, commit)
+	if !committed.OK || committed.Parent == nil {
+		t.Fatalf("commit=%#v", committed)
+	}
+	restarted, err := NewManager(ctx, manager.config, fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry := request(v2.OperationParentCommit, "resume-commit-after-restart")
+	retry.TransactionID = begun.TransactionID
+	repeated := restarted.Handle(ctx, retry)
+	if !repeated.OK || repeated.Parent == nil || repeated.Parent.ParentID != committed.Parent.ParentID {
+		t.Fatalf("receipt retry=%#v", repeated)
+	}
+}
+
+func TestParentDigestRejectsEmptyDirectoryMutation(t *testing.T) {
+	ctx := context.Background()
+	config := testConfig(t)
+	manager, err := NewManager(ctx, config, fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin := request(v2.OperationParentBegin, "tree-begin")
+	begin.CompatibilityKey = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+	begun := manager.Handle(ctx, begin)
+	_ = os.WriteFile(filepath.Join(begun.StagingPath, "probe"), []byte("parent"), 0600)
+	commit := request(v2.OperationParentCommit, "tree-commit")
+	commit.TransactionID = begun.TransactionID
+	parent := manager.Handle(ctx, commit).Parent
+	parentData := filepath.Join(config.StoreRoot, "parents", parent.ParentID, "data")
+	if err := os.Mkdir(filepath.Join(parentData, "injected-empty-directory"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(config.WorkspaceRoot, "tree-workspace")
+	_ = os.MkdirAll(workspace, 0700)
+	acquire := request(v2.OperationAcquire, "tree-acquire")
+	acquire.ConsumerID = "tree-consumer"
+	acquire.WorkspaceID = "tree-workspace"
+	acquire.ParentID = parent.ParentID
+	response := manager.Handle(ctx, acquire)
+	if response.Error == nil || response.Error.Code != "parent-corrupt" {
+		t.Fatalf("empty-directory mutation response=%#v", response)
+	}
+}
+
+func TestParentDigestRejectsModeMutation(t *testing.T) {
+	ctx := context.Background()
+	config := testConfig(t)
+	manager, err := NewManager(ctx, config, fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin := request(v2.OperationParentBegin, "mode-begin")
+	begin.CompatibilityKey = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	begun := manager.Handle(ctx, begin)
+	if err := os.WriteFile(filepath.Join(begun.StagingPath, "probe"), []byte("parent"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	commit := request(v2.OperationParentCommit, "mode-commit")
+	commit.TransactionID = begun.TransactionID
+	parent := manager.Handle(ctx, commit).Parent
+	probe := filepath.Join(config.StoreRoot, "parents", parent.ParentID, "data", "probe")
+	if err := os.Chmod(probe, 0644); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(config.WorkspaceRoot, "mode-workspace")
+	if err := os.MkdirAll(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	acquire := request(v2.OperationAcquire, "mode-acquire")
+	acquire.ConsumerID = "mode-consumer"
+	acquire.WorkspaceID = "mode-workspace"
+	acquire.ParentID = parent.ParentID
+	response := manager.Handle(ctx, acquire)
+	if response.Error == nil || response.Error.Code != "parent-corrupt" {
+		t.Fatalf("mode mutation response=%#v", response)
 	}
 }
 
@@ -259,7 +378,14 @@ func TestNativeManagerRestartCleansDeadClientLease(t *testing.T) {
 	commit := request(v2.OperationParentCommit, "dead-commit")
 	commit.TransactionID = begun.TransactionID
 	parent := first.Handle(ctx, commit).Parent
-	_ = os.MkdirAll(filepath.Join(config.WorkspaceRoot, "dead-ws"), 0700)
+	workspace := filepath.Join(config.WorkspaceRoot, "dead-ws")
+	projectFile := filepath.Join(workspace, "Assets", "survives.txt")
+	if err := os.MkdirAll(filepath.Dir(projectFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectFile, []byte("producer-owned"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	acquire := request(v2.OperationAcquire, "dead-acquire")
 	acquire.ConsumerID = "dead-consumer"
 	acquire.WorkspaceID = "dead-ws"
@@ -276,6 +402,16 @@ func TestNativeManagerRestartCleansDeadClientLease(t *testing.T) {
 	status := second.measureStatus()
 	if status.ActiveLeaseCount != 0 {
 		t.Fatalf("dead lease remains: %#v", status)
+	}
+	data, err := os.ReadFile(projectFile)
+	if err != nil || string(data) != "producer-owned" {
+		t.Fatalf("orphan recovery modified producer workspace: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, workspaceOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("workspace owner marker remains after recovery: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, "Library")); !os.IsNotExist(err) {
+		t.Fatalf("Library mount remains after recovery: %v", err)
 	}
 }
 

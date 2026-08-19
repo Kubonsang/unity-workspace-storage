@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -88,6 +89,11 @@ type pendingRecord struct {
 	CreatedAt        time.Time `json:"createdAt"`
 }
 
+type parentReceipt struct {
+	TransactionID string `json:"transactionId"`
+	ParentID      string `json:"parentId"`
+}
+
 type leaseJournal struct {
 	v2.Lease
 	ChildPath     string                     `json:"childPath"`
@@ -132,7 +138,7 @@ func NewManager(ctx context.Context, config Config, backend storage.Backend) (*M
 	if backend == nil {
 		backend = storage.NewBackend()
 	}
-	for _, path := range []string{config.StoreRoot, config.WorkspaceRoot, filepath.Join(config.StoreRoot, "parents"), filepath.Join(config.StoreRoot, "pending"), filepath.Join(config.StoreRoot, "children"), filepath.Join(config.StoreRoot, "leases"), filepath.Join(config.StoreRoot, "quarantine")} {
+	for _, path := range []string{config.StoreRoot, config.WorkspaceRoot, filepath.Join(config.StoreRoot, "parents"), filepath.Join(config.StoreRoot, "pending"), filepath.Join(config.StoreRoot, "children"), filepath.Join(config.StoreRoot, "leases"), filepath.Join(config.StoreRoot, "quarantine"), filepath.Join(config.StoreRoot, "receipts")} {
 		if err := os.MkdirAll(path, 0700); err != nil {
 			return nil, err
 		}
@@ -207,7 +213,24 @@ func (m *Manager) parentBegin(request v2.Request, fail failFunc) v2.Response {
 		return fail("invalid-compatibility-key", errors.New("compatibilityKey must be 64 lowercase hex characters"))
 	}
 	if parent, err := m.readParentByCompatibility(request.CompatibilityKey); err == nil {
-		return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
+		if verifyErr := verifyParent(parent); verifyErr == nil {
+			return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
+		}
+		if quarantineErr := m.quarantineParent(parent); quarantineErr != nil {
+			m.manualRecovery = true
+			return fail("parent-corrupt", quarantineErr)
+		}
+	} else {
+		parentID := parentID(m.backend.Provider(), request.CompatibilityKey)
+		if _, statErr := os.Lstat(filepath.Join(m.config.StoreRoot, "parents", parentID)); statErr == nil {
+			if quarantineErr := m.quarantineParentID(parentID); quarantineErr != nil {
+				m.manualRecovery = true
+				return fail("parent-corrupt", errors.Join(err, quarantineErr))
+			}
+		} else if !os.IsNotExist(statErr) {
+			m.manualRecovery = true
+			return fail("parent-corrupt", errors.Join(err, statErr))
+		}
 	}
 	txn, err := randomID("txn")
 	if err != nil {
@@ -229,38 +252,97 @@ func (m *Manager) parentCommit(request v2.Request, fail failFunc) v2.Response {
 	if !identifier.MatchString(request.TransactionID) {
 		return fail("invalid-transaction", errors.New("invalid transactionId"))
 	}
+	receipt, receiptErr := m.readParentReceipt(request.TransactionID)
+	if receiptErr == nil {
+		parent, parentErr := m.readParent(receipt.ParentID)
+		var verifyErr error
+		if parentErr == nil {
+			verifyErr = verifyParent(parent)
+		}
+		if parentErr != nil || verifyErr != nil {
+			m.manualRecovery = true
+			return fail("parent-corrupt", errors.Join(parentErr, verifyErr, errors.New("committed parent receipt is not valid")))
+		}
+		cleanupPendingTransaction(filepath.Join(m.config.StoreRoot, "pending", request.TransactionID))
+		return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
+	}
+	if !os.IsNotExist(receiptErr) {
+		m.manualRecovery = true
+		return fail("parent-receipt-corrupt", receiptErr)
+	}
 	dir := filepath.Join(m.config.StoreRoot, "pending", request.TransactionID)
 	var pending pendingRecord
 	if err := readJSON(filepath.Join(dir, "pending.json"), &pending); err != nil || pending.TransactionID != request.TransactionID || filepath.Clean(pending.StagingPath) != filepath.Join(dir, "data") {
 		return fail("transaction-not-found", errors.Join(err, errors.New("transaction identity mismatch")))
 	}
-	digest, logical, err := digestTree(pending.StagingPath)
-	if err != nil {
-		return fail("parent-invalid", err)
-	}
-	usage, err := fileusage.MeasureDirectoryUsage(pending.StagingPath)
-	if err != nil {
-		return fail("parent-invalid", err)
-	}
 	parentID := parentID(m.backend.Provider(), pending.CompatibilityKey)
 	parentDir := filepath.Join(m.config.StoreRoot, "parents", parentID)
-	dataPath := filepath.Join(parentDir, "data")
-	if err := os.Mkdir(parentDir, 0700); err != nil {
+	if _, err := os.Lstat(parentDir); err == nil {
+		existing, readErr := m.readParent(parentID)
+		if readErr == nil && existing.Compatibility == pending.CompatibilityKey {
+			if verifyErr := verifyParent(existing); verifyErr == nil {
+				if receiptErr := m.writeParentReceipt(request.TransactionID, parentID); receiptErr != nil {
+					return fail("parent-commit-failed", receiptErr)
+				}
+				cleanupPendingTransaction(dir)
+				return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &existing.Parent}
+			}
+		}
+		if quarantineErr := m.quarantineParentID(parentID); quarantineErr != nil {
+			return fail("parent-corrupt", errors.Join(readErr, quarantineErr))
+		}
+	} else if !os.IsNotExist(err) {
 		return fail("parent-commit-failed", err)
 	}
-	if err := os.Rename(pending.StagingPath, dataPath); err != nil {
+
+	publication := filepath.Join(dir, "publication")
+	publicationData := filepath.Join(publication, "data")
+	if _, err := os.Lstat(pending.StagingPath); err == nil {
+		if err := os.Mkdir(publication, 0700); err != nil && !os.IsExist(err) {
+			return fail("parent-commit-failed", err)
+		}
+		if _, err := os.Lstat(publicationData); err == nil {
+			return fail("parent-commit-failed", errors.New("both staging and publication data exist"))
+		} else if !os.IsNotExist(err) {
+			return fail("parent-commit-failed", err)
+		}
+		if err := os.Rename(pending.StagingPath, publicationData); err != nil {
+			return fail("parent-commit-failed", err)
+		}
+	} else if !os.IsNotExist(err) {
 		return fail("parent-commit-failed", err)
+	} else if _, err := os.Lstat(publicationData); err != nil {
+		return fail("transaction-not-found", errors.Join(err, errors.New("transaction has no resumable publication data")))
 	}
-	device, inode, err := directoryIdentity(dataPath)
+
+	digest, logical, err := digestTree(publicationData)
+	if err != nil {
+		return fail("parent-invalid", err)
+	}
+	usage, err := fileusage.MeasureDirectoryUsage(publicationData)
+	if err != nil {
+		return fail("parent-invalid", err)
+	}
+	device, inode, err := directoryIdentity(publicationData)
 	if err != nil {
 		return fail("parent-commit-failed", err)
 	}
-	parent := parentRecord{Parent: v2.Parent{ParentID: parentID, Compatibility: pending.CompatibilityKey, Provider: m.backend.Provider(), ArtifactKind: "directory", ContentDigest: digest, LogicalBytes: logical, AllocatedBytes: usage.AllocatedBytes, Immutable: true, CreatedAt: time.Now().UTC()}, DataPath: dataPath, Device: device, Inode: inode}
-	if err := writeJSON(filepath.Join(parentDir, "metadata.json"), parent); err != nil {
+	parent := parentRecord{Parent: v2.Parent{ParentID: parentID, Compatibility: pending.CompatibilityKey, Provider: m.backend.Provider(), ArtifactKind: "directory", ContentDigest: digest, LogicalBytes: logical, AllocatedBytes: usage.AllocatedBytes, Immutable: true, CreatedAt: time.Now().UTC()}, DataPath: filepath.Join(parentDir, "data"), Device: device, Inode: inode}
+	if err := writeJSON(filepath.Join(publication, "metadata.json"), parent); err != nil {
 		return fail("parent-commit-failed", err)
 	}
-	_ = os.Remove(filepath.Join(dir, "pending.json"))
-	_ = os.Remove(dir)
+	candidate := parent
+	candidate.DataPath = publicationData
+	if err := verifyParent(candidate); err != nil {
+		return fail("parent-invalid", err)
+	}
+	if err := os.Rename(publication, parentDir); err != nil {
+		return fail("parent-commit-failed", err)
+	}
+	if err := m.writeParentReceipt(request.TransactionID, parentID); err != nil {
+		return fail("parent-commit-failed", err)
+	}
+	cleanupPendingTransaction(dir)
 	return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
 }
 
@@ -377,10 +459,7 @@ func (m *Manager) release(ctx context.Context, request v2.Request, fail failFunc
 		m.manualRecovery = true
 		return fail(storageErrorCode(err), err)
 	}
-	if err := os.Remove(filepath.Join(journal.WorkspacePath, workspaceOwnerFile)); err != nil && !os.IsNotExist(err) {
-		return fail("workspace-cleanup-failed", err)
-	}
-	if err := os.RemoveAll(journal.WorkspacePath); err != nil {
+	if err := removeWorkspaceOwner(journal); err != nil {
 		return fail("workspace-cleanup-failed", err)
 	}
 	_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", request.LeaseID+".json"))
@@ -453,8 +532,11 @@ func (m *Manager) recover(ctx context.Context) error {
 		}
 		if journal.Snapshot == nil {
 			if _, err := os.Lstat(journal.ChildPath); os.IsNotExist(err) {
+				if ownerErr := removeWorkspaceOwner(&journal); ownerErr != nil && !os.IsNotExist(ownerErr) {
+					result = errors.Join(result, ownerErr)
+					continue
+				}
 				_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", entry.Name()))
-				_ = os.Remove(filepath.Join(journal.WorkspacePath, workspaceOwnerFile))
 				continue
 			}
 			result = errors.Join(result, errors.New("partial lease lacks ownership snapshot"))
@@ -478,8 +560,10 @@ func (m *Manager) recover(ctx context.Context) error {
 			result = errors.Join(result, err)
 			continue
 		}
-		_ = os.Remove(filepath.Join(journal.WorkspacePath, workspaceOwnerFile))
-		_ = os.RemoveAll(journal.WorkspacePath)
+		if err := removeWorkspaceOwner(&journal); err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
 		_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", entry.Name()))
 	}
 	return result
@@ -502,12 +586,17 @@ func (m *Manager) readParentByCompatibility(key string) (parentRecord, error) {
 }
 
 func (m *Manager) quarantineParent(parent parentRecord) error {
-	parentDir := filepath.Dir(parent.DataPath)
-	expected := filepath.Join(m.config.StoreRoot, "parents", parent.ParentID)
-	if filepath.Clean(parentDir) != filepath.Clean(expected) {
+	if filepath.Clean(filepath.Dir(parent.DataPath)) != filepath.Join(m.config.StoreRoot, "parents", parent.ParentID) {
 		return errors.New("refusing to quarantine parent outside owned path")
 	}
-	destination := filepath.Join(m.config.StoreRoot, "quarantine", parent.ParentID+fmt.Sprintf("-%d", time.Now().UnixNano()))
+	return m.quarantineParentID(parent.ParentID)
+}
+func (m *Manager) quarantineParentID(parentID string) error {
+	if !identifier.MatchString(parentID) {
+		return errors.New("invalid parent quarantine identity")
+	}
+	parentDir := filepath.Join(m.config.StoreRoot, "parents", parentID)
+	destination := filepath.Join(m.config.StoreRoot, "quarantine", parentID+fmt.Sprintf("-%d", time.Now().UnixNano()))
 	return os.Rename(parentDir, destination)
 }
 func (m *Manager) readLease(id string) (*leaseJournal, error) {
@@ -520,6 +609,20 @@ func (m *Manager) readLease(id string) (*leaseJournal, error) {
 		return nil, errors.New("lease identity mismatch")
 	}
 	return &j, nil
+}
+func (m *Manager) readParentReceipt(transactionID string) (parentReceipt, error) {
+	var receipt parentReceipt
+	err := readJSON(filepath.Join(m.config.StoreRoot, "receipts", transactionID+".json"), &receipt)
+	if err != nil {
+		return receipt, err
+	}
+	if receipt.TransactionID != transactionID || !identifier.MatchString(receipt.ParentID) {
+		return receipt, errors.New("parent receipt identity mismatch")
+	}
+	return receipt, nil
+}
+func (m *Manager) writeParentReceipt(transactionID, parentID string) error {
+	return writeJSON(filepath.Join(m.config.StoreRoot, "receipts", transactionID+".json"), parentReceipt{TransactionID: transactionID, ParentID: parentID})
 }
 
 func verifyParent(parent parentRecord) error {
@@ -581,6 +684,12 @@ func validateWorkspaceOwner(j *leaseJournal) error {
 	}
 	return nil
 }
+func removeWorkspaceOwner(j *leaseJournal) error {
+	if err := validateWorkspaceOwner(j); err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(j.WorkspacePath, workspaceOwnerFile))
+}
 func parentID(provider, key string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + key))
 	return "parent-" + hex.EncodeToString(sum[:16])
@@ -597,49 +706,66 @@ func randomID(prefix string) (string, error) {
 	return prefix + "-" + hex.EncodeToString(value), nil
 }
 func digestTree(root string) (string, int64, error) {
-	var paths []string
+	type treeEntry struct {
+		relative  string
+		mode      fs.FileMode
+		directory bool
+	}
+	var entries []treeEntry
 	err := filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if path == root {
-			return nil
-		}
 		if e.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symlink is not allowed: %s", path)
-		}
-		if e.IsDir() {
-			return nil
 		}
 		info, err := e.Info()
 		if err != nil {
 			return err
 		}
-		if !info.Mode().IsRegular() {
+		if !e.IsDir() && !info.Mode().IsRegular() {
 			return fmt.Errorf("special file is not allowed: %s", path)
 		}
-		if e.Name() == reservedStorageMarker || e.Name() == workspaceOwnerFile {
+		if path != root && (e.Name() == reservedStorageMarker || e.Name() == workspaceOwnerFile) {
 			return fmt.Errorf("reserved marker is not allowed: %s", path)
 		}
-		rel, _ := filepath.Rel(root, path)
-		paths = append(paths, filepath.ToSlash(rel))
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, treeEntry{relative: filepath.ToSlash(rel), mode: info.Mode().Perm(), directory: e.IsDir()})
 		return nil
 	})
 	if err != nil {
 		return "", 0, err
 	}
-	sort.Strings(paths)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].relative < entries[j].relative })
 	h := sha256.New()
+	_, _ = h.Write([]byte("unity-workspace-storage-tree-v2\x00"))
 	var logical int64
-	for _, rel := range paths {
-		path := filepath.Join(root, filepath.FromSlash(rel))
+	for _, entry := range entries {
+		kind := byte('f')
+		if entry.directory {
+			kind = 'd'
+		}
+		_, _ = h.Write([]byte{kind})
+		writeDigestField(h, []byte(entry.relative))
+		var mode [4]byte
+		binary.BigEndian.PutUint32(mode[:], uint32(entry.mode.Perm()))
+		_, _ = h.Write(mode[:])
+		if entry.directory {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(entry.relative))
 		f, err := os.Open(path)
 		if err != nil {
 			return "", 0, err
 		}
 		info, _ := f.Stat()
 		logical += info.Size()
-		io.WriteString(h, rel+"\x00")
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(info.Size()))
+		_, _ = h.Write(size[:])
 		_, copyErr := io.Copy(h, f)
 		closeErr := f.Close()
 		if copyErr != nil || closeErr != nil {
@@ -647,6 +773,16 @@ func digestTree(root string) (string, int64, error) {
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), logical, nil
+}
+func writeDigestField(writer io.Writer, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = writer.Write(size[:])
+	_, _ = writer.Write(value)
+}
+func cleanupPendingTransaction(dir string) {
+	_ = os.Remove(filepath.Join(dir, "pending.json"))
+	_ = os.Remove(dir)
 }
 func writeJSON(path string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")

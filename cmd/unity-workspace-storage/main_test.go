@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -52,6 +53,23 @@ func TestTopLevelRoutesSchema2StatusFlag(t *testing.T) {
 	}
 	if result.(v2.Response).Status == nil {
 		t.Fatal("missing status")
+	}
+}
+
+func TestCommandErrorPreservesSchema2ResponseAndStableCode(t *testing.T) {
+	response := v2.Response{SchemaVersion: 2, RequestID: "release-v2", Error: &v2.Error{Code: "lease-not-found", Operation: v2.OperationRelease, Message: "missing"}}
+	value := commandErrorValue([]string{"workspace", "release", "--schema", "2"}, "release", response, response.Error)
+	actual, ok := value.(v2.Response)
+	if !ok || actual.SchemaVersion != 2 || actual.Error == nil || actual.Error.Code != "lease-not-found" {
+		t.Fatalf("value=%#v", value)
+	}
+}
+
+func TestCommandParseErrorUsesRequestedSchema(t *testing.T) {
+	value := commandErrorValue([]string{"parent", "begin"}, "parent-begin", nil, errors.New("missing key"))
+	actual, ok := value.(cliError)
+	if !ok || actual.SchemaVersion != 2 {
+		t.Fatalf("value=%#v", value)
 	}
 }
 

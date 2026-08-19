@@ -65,8 +65,11 @@ Example acquire request:
 ```
 
 The producer creates `workspaceRoot/workspaceId` before acquire; `Library` must
-not exist. Release removes only a workspace carrying the exact daemon-authored
-owner marker and exact lease identity.
+not exist. Release validates the exact daemon-authored owner marker and lease
+identity, removes the `Library` link and daemon-owned child, then removes only
+that marker. The producer-owned workspace directory and all other project
+content remain in place. Restart recovery follows the same ownership-safe
+cleanup rule for orphaned leases.
 
 ## Service manager examples
 

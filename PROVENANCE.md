@@ -113,6 +113,13 @@ to match the original checkpoint exactly. Windows schema 1 remains the RC
 compatibility boundary; schema 2 adapters and Unix native evidence carry their
 own tests and CI history.
 
+Because CI does not clone the TestPlay source repository, the normalized
+destination hashes for those same 42 mapped files are committed in
+`provenance/frozen-destination-sha256.tsv`. Every Windows matrix job runs
+`scripts/verify-frozen-destination-parity.ps1` immediately after checkout and
+fails if a frozen destination is missing or drifts. The source-aware verifier
+remains the stronger local check when the original repository is available.
+
 The schema-2 daemon selects the additive `storage.NewDaemonBackend`. On Linux
 it delegates to the frozen reflink implementation. On macOS its additive
 adapter preserves the frozen `clonefileat` tree walk while allowing absolute

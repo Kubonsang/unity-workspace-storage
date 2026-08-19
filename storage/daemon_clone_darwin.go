@@ -74,7 +74,7 @@ func cloneRegularFileForDaemon(source, destination string) error {
 	// validateCloneSource rejects source-tree symlinks. Avoiding
 	// CLONE_NOFOLLOW_ANY here permits absolute paths that traverse harmless
 	// system aliases such as macOS /var -> /private/var.
-	err := unix.Clonefileat(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.CLONE_NOOWNERCOPY)
+	err := unix.Clonefileat(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.CLONE_NOFOLLOW|unix.CLONE_NOOWNERCOPY)
 	if err == nil {
 		return nil
 	}

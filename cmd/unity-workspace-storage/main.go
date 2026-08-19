@@ -36,10 +36,32 @@ type cliErrorBody struct {
 func main() {
 	operation, result, err := executeTop(context.Background(), os.Args[1:], os.Stdin, contract.Default(), v2.New(defaultV2Client()))
 	if err != nil {
-		writeJSON(os.Stdout, cliError{SchemaVersion: contract.SchemaVersion, OK: false, Operation: operation, Error: cliErrorBody{Code: "workspace-command-failed", Message: err.Error()}})
+		writeJSON(os.Stdout, commandErrorValue(os.Args[1:], operation, result, err))
 		os.Exit(1)
 	}
 	writeJSON(os.Stdout, result)
+}
+
+func commandErrorValue(args []string, operation string, result any, err error) any {
+	if response, ok := result.(v2.Response); ok {
+		response.SchemaVersion = v2.SchemaVersion
+		response.OK = false
+		if response.Error == nil {
+			response.Error = &v2.Error{Code: "workspace-command-failed", Operation: operation, Message: err.Error()}
+		}
+		return response
+	}
+	version := contract.SchemaVersion
+	if len(args) > 0 && (args[0] == "parent" || args[0] == "serve") {
+		version = v2.SchemaVersion
+	}
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == "--schema" && args[index+1] == "2" {
+			version = v2.SchemaVersion
+			break
+		}
+	}
+	return cliError{SchemaVersion: version, OK: false, Operation: operation, Error: cliErrorBody{Code: "workspace-command-failed", Message: err.Error()}}
 }
 
 func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy lifecycle, modern v2.Service) (string, any, error) {
