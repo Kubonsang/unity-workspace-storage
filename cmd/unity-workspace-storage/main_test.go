@@ -89,6 +89,18 @@ func TestTopLevelSchema2DecodeErrorReturnsTypedResponse(t *testing.T) {
 	}
 }
 
+func TestTopLevelTruncatedSchema2RequestReturnsTypedResponse(t *testing.T) {
+	input := `{"schemaVersion":2,"requestId":"truncated-v2","consumerId":`
+	operation, result, err := executeTop(context.Background(), []string{"workspace", "acquire"}, strings.NewReader(input), &fakeLifecycle{}, v2.Service{})
+	if err == nil {
+		t.Fatal("expected syntax error")
+	}
+	response, ok := result.(v2.Response)
+	if !ok || response.SchemaVersion != 2 || response.RequestID != "truncated-v2" || response.Error == nil || response.Error.Code != "invalid-request" {
+		t.Fatalf("operation=%s response=%#v", operation, result)
+	}
+}
+
 func (fake *fakeLifecycle) Acquire(_ context.Context, request contract.AcquireRequest) (contract.AcquireResponse, error) {
 	fake.acquire = request
 	return contract.AcquireResponse{SchemaVersion: contract.SchemaVersion}, nil

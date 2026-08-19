@@ -33,6 +33,12 @@ type cliErrorBody struct {
 	Message string `json:"message"`
 }
 
+type requestHeader struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	RequestID     string `json:"requestId"`
+	Operation     string `json:"operation"`
+}
+
 func main() {
 	operation, result, err := executeTop(context.Background(), os.Args[1:], os.Stdin, contract.Default(), v2.New(defaultV2Client()))
 	if err != nil {
@@ -92,13 +98,12 @@ func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy life
 			if err != nil {
 				return "acquire", nil, err
 			}
-			var header struct {
-				SchemaVersion int    `json:"schemaVersion"`
-				RequestID     string `json:"requestId"`
-				Operation     string `json:"operation"`
-			}
-			if err := json.Unmarshal(data, &header); err != nil {
-				return "acquire", nil, err
+			header, headerErr := readRequestHeader(data)
+			if headerErr != nil {
+				if schema == v2.SchemaVersion || header.SchemaVersion == v2.SchemaVersion {
+					return "acquire", invalidV2Response(header.RequestID, v2.OperationAcquire, headerErr), headerErr
+				}
+				return "acquire", nil, headerErr
 			}
 			schema = header.SchemaVersion
 			if schema == 2 {
@@ -183,6 +188,43 @@ func executeWorkspaceV2(ctx context.Context, args []string, service v2.Service) 
 
 func invalidV2Response(requestID, operation string, err error) v2.Response {
 	return v2.Response{SchemaVersion: v2.SchemaVersion, RequestID: requestID, OK: false, Error: &v2.Error{Code: "invalid-request", Operation: operation, Message: err.Error()}}
+}
+
+func readRequestHeader(data []byte) (requestHeader, error) {
+	var header requestHeader
+	if err := json.Unmarshal(data, &header); err == nil {
+		return header, nil
+	} else {
+		completeErr := err
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		opening, tokenErr := decoder.Token()
+		if tokenErr != nil || opening != json.Delim('{') {
+			return header, completeErr
+		}
+		for decoder.More() {
+			name, tokenErr := decoder.Token()
+			if tokenErr != nil {
+				break
+			}
+			key, ok := name.(string)
+			if !ok {
+				break
+			}
+			var raw json.RawMessage
+			if decodeErr := decoder.Decode(&raw); decodeErr != nil {
+				break
+			}
+			switch key {
+			case "schemaVersion":
+				_ = json.Unmarshal(raw, &header.SchemaVersion)
+			case "requestId":
+				_ = json.Unmarshal(raw, &header.RequestID)
+			case "operation":
+				_ = json.Unmarshal(raw, &header.Operation)
+			}
+		}
+		return header, completeErr
+	}
 }
 
 func readRequestData(args []string, stdin io.Reader) ([]byte, error) {
