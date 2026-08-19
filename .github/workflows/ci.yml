@@ -62,12 +62,12 @@ jobs:
         run: go test ./storage ./internal/workspaced -count=1
 
   macos-native-apfs:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.26.x'
           cache: true
       - name: Native APFS lifecycle and restart recovery
         env:
