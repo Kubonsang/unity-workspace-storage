@@ -4,7 +4,13 @@ param(
     [string]$SourceRoot = (Join-Path $PSScriptRoot '..\..'),
 
     [Parameter()]
-    [string]$Checkpoint = 'beabf36a299572607232806807ad9b9c2d4cb222'
+    [string]$Checkpoint = 'beabf36a299572607232806807ad9b9c2d4cb222',
+
+    [Parameter()]
+    [string]$OverlayManifest = '',
+
+    [Parameter()]
+    [string]$OverlayCheckpoint = '5d5cbe16dd2da2e58365b311d99b87e87598c09f'
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +19,11 @@ $ErrorActionPreference = 'Stop'
 $moduleRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $manifestPath = Join-Path $moduleRoot 'provenance\source-map.tsv'
+$overlayManifestPath = if ([string]::IsNullOrWhiteSpace($OverlayManifest)) {
+    Join-Path $moduleRoot 'provenance\post-rc-source-map.tsv'
+} else {
+    [IO.Path]::GetFullPath($OverlayManifest)
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot '.git'))) {
     throw "SourceRoot is not the testplay-runner checkout: $sourceRoot"
@@ -43,23 +54,74 @@ function Transform-ProviderSource([string]$Path, [string]$Value) {
     throw "Unexpected provider source: $Path"
 }
 
+function Add-SourceMap(
+    [Collections.Specialized.OrderedDictionary]$Entries,
+    [string]$Path,
+    [string]$EntryCheckpoint,
+    [bool]$IsOverlay
+) {
+    $seenInManifest = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+        $parts = $line -split "`t"
+        if ($parts.Count -ne 3) {
+            throw "Invalid source map line in ${Path}: $line"
+        }
+        $expectedBlob, $sourcePath, $destinationPath = $parts
+        if (-not $seenInManifest.Add($destinationPath)) {
+            throw "Duplicate destination path in ${Path}: $destinationPath"
+        }
+        if ($IsOverlay -and $Entries.Contains($destinationPath)) {
+            if ($Entries[$destinationPath].SourcePath -ne $sourcePath) {
+                throw "Overlay remaps frozen destination ${destinationPath}: expected=$($Entries[$destinationPath].SourcePath) actual=$sourcePath"
+            }
+            $Entries[$destinationPath] = [pscustomobject]@{
+                ExpectedBlob = $expectedBlob
+                SourcePath = $sourcePath
+                DestinationPath = $destinationPath
+                Checkpoint = $EntryCheckpoint
+                IsOverlay = $true
+            }
+            continue
+        }
+        if ($Entries.Contains($destinationPath)) {
+            throw "Duplicate destination path in source map: $destinationPath"
+        }
+        $Entries.Add($destinationPath, [pscustomobject]@{
+            ExpectedBlob = $expectedBlob
+            SourcePath = $sourcePath
+            DestinationPath = $destinationPath
+            Checkpoint = $EntryCheckpoint
+            IsOverlay = $IsOverlay
+        })
+    }
+}
+
+$entries = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+Add-SourceMap $entries $manifestPath $Checkpoint $false
+if ($null -ne $overlayManifestPath) {
+    if (-not (Test-Path -LiteralPath $overlayManifestPath -PathType Leaf)) {
+        throw "Overlay source map does not exist: $overlayManifestPath"
+    }
+    Add-SourceMap $entries $overlayManifestPath $OverlayCheckpoint $true
+}
+
 $failures = [Collections.Generic.List[string]]::new()
 $checked = 0
-foreach ($line in Get-Content -LiteralPath $manifestPath) {
-    if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
-        continue
-    }
-    $parts = $line -split "`t"
-    if ($parts.Count -ne 3) {
-        throw "Invalid source map line: $line"
-    }
-    $expectedBlob, $sourcePath, $destinationPath = $parts
-    $actualBlob = (& git -c "safe.directory=$($sourceRoot.Replace('\', '/'))" -C $sourceRoot rev-parse "${Checkpoint}:$sourcePath").Trim()
+$overlayChecked = 0
+foreach ($entry in $entries.Values) {
+    $expectedBlob = $entry.ExpectedBlob
+    $sourcePath = $entry.SourcePath
+    $destinationPath = $entry.DestinationPath
+    $entryCheckpoint = $entry.Checkpoint
+    $actualBlob = (& git -c "safe.directory=$($sourceRoot.Replace('\', '/'))" -C $sourceRoot rev-parse "${entryCheckpoint}:$sourcePath").Trim()
     if ($LASTEXITCODE -ne 0 -or $actualBlob -ne $expectedBlob) {
-        $failures.Add("checkpoint blob mismatch: $sourcePath expected=$expectedBlob actual=$actualBlob")
+        $failures.Add("checkpoint blob mismatch: checkpoint=$entryCheckpoint path=$sourcePath expected=$expectedBlob actual=$actualBlob")
         continue
     }
-    $sourceText = (& git -c "safe.directory=$($sourceRoot.Replace('\', '/'))" -C $sourceRoot show "${Checkpoint}:$sourcePath") -join "`n"
+    $sourceText = (& git -c "safe.directory=$($sourceRoot.Replace('\', '/'))" -C $sourceRoot show "${entryCheckpoint}:$sourcePath") -join "`n"
     if ($LASTEXITCODE -ne 0) {
         $failures.Add("cannot read checkpoint source: $sourcePath")
         continue
@@ -76,6 +138,9 @@ foreach ($line in Get-Content -LiteralPath $manifestPath) {
         continue
     }
     $checked++
+    if ($entry.IsOverlay) {
+        $overlayChecked++
+    }
 }
 
 if ($failures.Count -ne 0) {
@@ -86,6 +151,8 @@ if ($failures.Count -ne 0) {
 [ordered]@{
     schemaVersion = 1
     status = 'PASS'
-    checkpoint = $Checkpoint
+    frozenCheckpoint = $Checkpoint
+    overlayCheckpoint = if ($null -eq $overlayManifestPath) { $null } else { $OverlayCheckpoint }
     filesChecked = $checked
+    overlayFilesChecked = $overlayChecked
 } | ConvertTo-Json
