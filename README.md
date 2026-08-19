@@ -99,11 +99,15 @@ go vet ./...
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\verify-source-parity.ps1 `
   -SourceRoot ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\verify-frozen-destination-parity.ps1 `
+  -OverlayManifest .\provenance\post-rc-destination-sha256.tsv
 ```
 
 The copied provider tests remain in `workspace` and `storage`. The parity
-script verifies every mapped file against the frozen Git blob after only the
-documented package/import disentangling transformations.
+script verifies the unchanged frozen source map plus the explicit post-RC
+security overlay after only the documented package/import disentangling
+transformations. The original checkpoint manifests are not overwritten.
 
 See [PROVENANCE.md](PROVENANCE.md) for the exact checkpoint and deliberate
 compatibility debt.

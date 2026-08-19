@@ -17,10 +17,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Verify frozen provider parity
+      - name: Verify layered provider parity
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: ./scripts/verify-frozen-destination-parity.ps1
+        run: ./scripts/verify-frozen-destination-parity.ps1 -OverlayManifest ./provenance/post-rc-destination-sha256.tsv
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'

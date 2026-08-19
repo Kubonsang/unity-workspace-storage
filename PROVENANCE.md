@@ -8,6 +8,8 @@
 - release-preparation base: `0bd5dde4da3b92be8a41fa9a98990aafe17b665b`
 - **frozen provider checkpoint:**
   `beabf36a299572607232806807ad9b9c2d4cb222`
+- post-RC synchronized security checkpoint:
+  `5d5cbe16dd2da2e58365b311d99b87e87598c09f`
 - preflight-validated head:
   `d7b772cbb4dbd00a79a1a9af0d5fd9f10e8e9c5f`
 - extraction started from observation head:
@@ -16,7 +18,9 @@
 Before extraction, `git diff --exit-code beabf36 -- internal/vhdxworkspace
 internal/vhdxstorage` returned success at the observation head. The individual
 checkpoint blob IDs and destinations are committed in
-`provenance/source-map.tsv`.
+`provenance/source-map.tsv`. That 42-file frozen map remains unchanged. The
+five-file synchronized security delta is recorded separately in
+`provenance/post-rc-source-map.tsv`.
 
 ## Mapping and allowed transformations
 
@@ -78,6 +82,9 @@ go test ./... -count=1
 go vet ./...
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\verify-source-parity.ps1 -SourceRoot ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\verify-frozen-destination-parity.ps1 `
+  -OverlayManifest .\provenance\post-rc-destination-sha256.tsv
 Pop-Location
 ```
 
@@ -103,22 +110,52 @@ These are static/local Windows checks. No privileged native VHDX evidence was
 rerun because provider bytes are checkpoint-derived and this extraction does
 not claim a new native result.
 
+## Post-RC synchronized security fix
+
+The frozen checkpoint and `codex/release-v0.13.0-rc.1` remain unchanged. A
+separate TestPlay follow-up passes the already-durable installed-user SID into
+writable parent, child, and recovery attaches. This prevents
+`AttachVirtualDisk` from inheriting the LocalSystem-owned VHDX file DACL while
+leaving public schemas, journal fields, cleanup, quarantine, and recovery
+state transitions unchanged.
+
+The synchronized TestPlay source patch is recorded in
+[`testplay-runner#47`](https://github.com/Kubonsang/testplay-runner/pull/47).
+
+The extracted provider carries the package-renamed form of that patch and its
+opt-in non-elevated VHDX regression test. Four frozen destinations are
+explicitly overlaid and one test destination is added. The original manifests
+remain intact; current-head verification composes them with the post-RC
+source and destination overlay manifests.
+
+### Observed post-RC security checks (2026-08-19)
+
+| Check | Result |
+|---|---|
+| original frozen source map | UNCHANGED — 42 entries remain anchored at `beabf36a` |
+| layered source parity | PASS — 43 active destinations, including 5 post-RC overlay entries |
+| layered destination parity | PASS — 42 frozen hashes composed with 5 overlay hashes |
+| extracted full tests / vet | PASS |
+| changed-package race detector | PASS |
+| non-elevated installed-user VHDX write/read/delete/abort | PASS — clean abort and residual counts unchanged |
+
 ## Post-extraction schema 2 development
 
 Provider-neutral schema 2, the Unix user daemon, and durable Unix lease
 recovery are additive files developed after the frozen extraction. They are
-not represented as checkpoint-derived source in `provenance/source-map.tsv`.
-The parity verifier continues to require all 42 mapped schema-1/provider files
-to match the original checkpoint exactly. Windows schema 1 remains the RC
+not represented as checkpoint-derived source in either source map. The parity
+verifier resolves the unchanged 42-file frozen map plus the five-file post-RC
+overlay to 43 active provider destinations. Windows schema 1 remains the RC
 compatibility boundary; schema 2 adapters and Unix native evidence carry their
 own tests and CI history.
 
 Because CI does not clone the TestPlay source repository, the normalized
 destination hashes for those same 42 mapped files are committed in
-`provenance/frozen-destination-sha256.tsv`. Every Windows matrix job runs
-`scripts/verify-frozen-destination-parity.ps1` immediately after checkout and
-fails if a frozen destination is missing or drifts. The source-aware verifier
-remains the stronger local check when the original repository is available.
+`provenance/frozen-destination-sha256.tsv`. The original hashes are unchanged;
+`provenance/post-rc-destination-sha256.tsv` records the synchronized delta.
+Every Windows matrix job composes both manifests and fails if an active
+provider destination is missing or drifts. The source-aware verifier remains
+the stronger local check when the original repository is available.
 
 The schema-2 daemon selects the additive `storage.NewDaemonBackend`. On Linux
 it delegates to the frozen reflink implementation. On macOS its additive
