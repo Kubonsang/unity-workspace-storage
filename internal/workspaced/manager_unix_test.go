@@ -70,7 +70,7 @@ func TestManagerParentAcquireStatusRelease(t *testing.T) {
 	}
 	manager.snapshotLease = func(lease storage.Lease) (storage.UnixLeaseSnapshot, error) {
 		info := lease.Info()
-		return storage.UnixLeaseSnapshot{ParentPath: info.ParentPath, ChildPath: info.ChildPath, MountPath: info.MountPath, LeaseID: filepath.Base(info.ChildPath)}, nil
+		return storage.UnixLeaseSnapshot{StoreRoot: filepath.Dir(info.ChildPath), ParentPath: info.ParentPath, ChildPath: info.ChildPath, MountPath: info.MountPath, LeaseID: filepath.Base(info.ChildPath), OwnerToken: "storage-owner"}, nil
 	}
 	key := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	begin := request(v2.OperationParentBegin, "begin-1")
@@ -175,6 +175,42 @@ func TestParentCommitResumesPublicationAndUsesDurableReceipt(t *testing.T) {
 	repeated := restarted.Handle(ctx, retry)
 	if !repeated.OK || repeated.Parent == nil || repeated.Parent.ParentID != committed.Parent.ParentID {
 		t.Fatalf("receipt retry=%#v", repeated)
+	}
+}
+
+func TestConcurrentParentCommitRemovesRedundantStagingTree(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(ctx, testConfig(t), fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac"
+	first := request(v2.OperationParentBegin, "same-key-first")
+	first.CompatibilityKey = key
+	second := request(v2.OperationParentBegin, "same-key-second")
+	second.CompatibilityKey = key
+	firstBegun := manager.Handle(ctx, first)
+	secondBegun := manager.Handle(ctx, second)
+	for _, begun := range []v2.Response{firstBegun, secondBegun} {
+		if !begun.OK {
+			t.Fatalf("begin=%#v", begun)
+		}
+		if err := os.WriteFile(filepath.Join(begun.StagingPath, "probe"), []byte("same-parent"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstCommit := request(v2.OperationParentCommit, "same-key-first-commit")
+	firstCommit.TransactionID = firstBegun.TransactionID
+	if response := manager.Handle(ctx, firstCommit); !response.OK {
+		t.Fatalf("first commit=%#v", response)
+	}
+	secondCommit := request(v2.OperationParentCommit, "same-key-second-commit")
+	secondCommit.TransactionID = secondBegun.TransactionID
+	if response := manager.Handle(ctx, secondCommit); !response.OK {
+		t.Fatalf("second commit=%#v", response)
+	}
+	if _, err := os.Lstat(filepath.Dir(secondBegun.StagingPath)); !os.IsNotExist(err) {
+		t.Fatalf("redundant pending tree remains: %v", err)
 	}
 }
 
@@ -297,7 +333,14 @@ func TestManagerFailClosedOnUnrecoverableLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager.recoverLease = func(storage.UnixLeaseSnapshot) (storage.Lease, error) { return nil, errors.New("identity changed") }
-	journal := leaseJournal{Lease: v2.Lease{LeaseID: "lease-bad", WorkspacePath: filepath.Join(manager.config.WorkspaceRoot, "ws-bad")}, Snapshot: &storage.UnixLeaseSnapshot{LeaseID: "lease-bad"}}
+	workspacePath := filepath.Join(manager.config.WorkspaceRoot, "ws-bad")
+	childPath := filepath.Join(manager.config.StoreRoot, "children", "lease-bad")
+	mountPath := filepath.Join(workspacePath, "Library")
+	parentPath := filepath.Join(manager.config.StoreRoot, "parents", "parent-bad", "data")
+	if err := os.MkdirAll(childPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journal := leaseJournal{SchemaVersion: 2, Lease: v2.Lease{LeaseID: "lease-bad", ConsumerID: "consumer-bad", WorkspaceID: "ws-bad", ParentID: "parent-bad", WorkspacePath: workspacePath, MountPath: mountPath, State: "ready"}, ChildPath: childPath, ClientPID: os.Getpid(), BootSessionID: manager.bootID, OwnerToken: "workspace-owner", Snapshot: &storage.UnixLeaseSnapshot{StoreRoot: filepath.Join(manager.config.StoreRoot, "children"), ParentPath: parentPath, ChildPath: childPath, MountPath: mountPath, LeaseID: "lease-bad", OwnerToken: "storage-owner"}}
 	if err := writeJSON(filepath.Join(manager.config.StoreRoot, "leases", "lease-bad.json"), journal); err != nil {
 		t.Fatal(err)
 	}
@@ -307,6 +350,133 @@ func TestManagerFailClosedOnUnrecoverableLease(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(manager.config.StoreRoot, "leases", "lease-bad.json")); err != nil {
 		t.Fatalf("journal was deleted: %v", err)
 	}
+}
+
+func TestAcquireInitialJournalFailureRemovesWorkspaceOwner(t *testing.T) {
+	ctx := context.Background()
+	manager, parentID := managerWithCommittedParent(t, ctx)
+	workspacePath := filepath.Join(manager.config.WorkspaceRoot, "journal-fail-ws")
+	if err := os.MkdirAll(workspacePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manager.writeLeaseJSON = func(string, any) error { return errors.New("injected journal failure") }
+	acquire := request(v2.OperationAcquire, "journal-fail-acquire")
+	acquire.ConsumerID = "journal-fail-consumer"
+	acquire.WorkspaceID = "journal-fail-ws"
+	acquire.ParentID = parentID
+	response := manager.Handle(ctx, acquire)
+	if response.Error == nil || response.Error.Code != "journal-write-failed" {
+		t.Fatalf("response=%#v", response)
+	}
+	if _, err := os.Lstat(filepath.Join(workspacePath, workspaceOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("workspace owner marker remains: %v", err)
+	}
+}
+
+func TestAcquireReadyJournalFailureRollsBackLease(t *testing.T) {
+	ctx := context.Background()
+	manager, parentID := managerWithCommittedParent(t, ctx)
+	manager.snapshotLease = func(lease storage.Lease) (storage.UnixLeaseSnapshot, error) {
+		info := lease.Info()
+		return storage.UnixLeaseSnapshot{StoreRoot: filepath.Dir(info.ChildPath), ParentPath: info.ParentPath, ChildPath: info.ChildPath, MountPath: info.MountPath, LeaseID: filepath.Base(info.ChildPath), OwnerToken: "storage-owner"}, nil
+	}
+	writes := 0
+	manager.writeLeaseJSON = func(path string, value any) error {
+		writes++
+		if writes == 2 {
+			return errors.New("injected ready journal failure")
+		}
+		return writeJSON(path, value)
+	}
+	workspacePath := filepath.Join(manager.config.WorkspaceRoot, "ready-fail-ws")
+	if err := os.MkdirAll(workspacePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	acquire := request(v2.OperationAcquire, "ready-fail-acquire")
+	acquire.ConsumerID = "ready-fail-consumer"
+	acquire.WorkspaceID = "ready-fail-ws"
+	acquire.ParentID = parentID
+	response := manager.Handle(ctx, acquire)
+	if response.Error == nil || response.Error.Code != "journal-write-failed" {
+		t.Fatalf("response=%#v", response)
+	}
+	for _, path := range []string{filepath.Join(workspacePath, workspaceOwnerFile), filepath.Join(workspacePath, "Library")} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("rollback path remains: %s err=%v", path, err)
+		}
+	}
+	children, err := os.ReadDir(filepath.Join(manager.config.StoreRoot, "children"))
+	if err != nil || len(children) != 0 {
+		t.Fatalf("rollback child remains: entries=%v err=%v", children, err)
+	}
+	leases, err := os.ReadDir(filepath.Join(manager.config.StoreRoot, "leases"))
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("rollback journal remains: entries=%v err=%v", leases, err)
+	}
+}
+
+func TestRecoveryRejectsJournalOutsideConfiguredRoots(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(ctx, testConfig(t), fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	manager.recoverLease = func(storage.UnixLeaseSnapshot) (storage.Lease, error) {
+		called = true
+		return nil, errors.New("must not be called")
+	}
+	workspacePath := filepath.Join(manager.config.WorkspaceRoot, "tampered-ws")
+	childPath := filepath.Join(manager.config.StoreRoot, "children", "lease-tampered")
+	mountPath := filepath.Join(workspacePath, "Library")
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(childPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(outside, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	journal := leaseJournal{SchemaVersion: 2, Lease: v2.Lease{LeaseID: "lease-tampered", ConsumerID: "consumer-tampered", WorkspaceID: "tampered-ws", ParentID: "parent-tampered", WorkspacePath: workspacePath, MountPath: mountPath, State: "ready"}, ChildPath: childPath, ClientPID: os.Getpid(), BootSessionID: manager.bootID, OwnerToken: "workspace-owner", Snapshot: &storage.UnixLeaseSnapshot{StoreRoot: outside, ParentPath: filepath.Join(manager.config.StoreRoot, "parents", "parent-tampered", "data"), ChildPath: childPath, MountPath: mountPath, LeaseID: "lease-tampered", OwnerToken: "storage-owner"}}
+	if err := writeJSON(filepath.Join(manager.config.StoreRoot, "leases", "lease-tampered.json"), journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recover(ctx); err == nil {
+		t.Fatal("expected structural recovery validation failure")
+	}
+	if called {
+		t.Fatal("untrusted snapshot reached storage recovery")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+		t.Fatalf("outside sentinel changed: data=%q err=%v", data, err)
+	}
+}
+
+func managerWithCommittedParent(t *testing.T, ctx context.Context) (*Manager, string) {
+	t.Helper()
+	manager, err := NewManager(ctx, testConfig(t), fakeBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin := request(v2.OperationParentBegin, "helper-begin")
+	begin.CompatibilityKey = "fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa"
+	begun := manager.Handle(ctx, begin)
+	if !begun.OK {
+		t.Fatal(begun.Error)
+	}
+	if err := os.WriteFile(filepath.Join(begun.StagingPath, "probe"), []byte("parent"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	commit := request(v2.OperationParentCommit, "helper-commit")
+	commit.TransactionID = begun.TransactionID
+	committed := manager.Handle(ctx, commit)
+	if !committed.OK || committed.Parent == nil {
+		t.Fatalf("commit=%#v", committed)
+	}
+	return manager, committed.Parent.ParentID
 }
 
 func TestNativeManagerRestartRecoversLiveLease(t *testing.T) {
@@ -399,7 +569,10 @@ func TestNativeManagerRestartCleansDeadClientLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status := second.measureStatus()
+	status, err := second.measureStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if status.ActiveLeaseCount != 0 {
 		t.Fatalf("dead lease remains: %#v", status)
 	}

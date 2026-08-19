@@ -65,6 +65,9 @@ func commandErrorValue(args []string, operation string, result any, err error) a
 }
 
 func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy lifecycle, modern v2.Service) (string, any, error) {
+	// Flag removal below must not mutate os.Args, which commandErrorValue uses
+	// to choose the public error envelope after executeTop returns.
+	args = append([]string(nil), args...)
 	if len(args) > 0 && args[0] == "serve" {
 		return "serve", nil, platformServe(ctx, args[1:])
 	}
@@ -90,7 +93,9 @@ func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy life
 				return "acquire", nil, err
 			}
 			var header struct {
-				SchemaVersion int `json:"schemaVersion"`
+				SchemaVersion int    `json:"schemaVersion"`
+				RequestID     string `json:"requestId"`
+				Operation     string `json:"operation"`
 			}
 			if err := json.Unmarshal(data, &header); err != nil {
 				return "acquire", nil, err
@@ -99,10 +104,11 @@ func executeTop(ctx context.Context, args []string, stdin io.Reader, legacy life
 			if schema == 2 {
 				var request v2.Request
 				if err := decodeBytes(data, &request); err != nil {
-					return "acquire", nil, err
+					return "acquire", invalidV2Response(header.RequestID, v2.OperationAcquire, err), err
 				}
 				if request.Operation != "" && request.Operation != v2.OperationAcquire {
-					return "acquire", nil, errors.New("request operation must be workspace-acquire")
+					err := errors.New("request operation must be workspace-acquire")
+					return "acquire", invalidV2Response(request.RequestID, v2.OperationAcquire, err), err
 				}
 				response, err := modern.Acquire(ctx, v2.AcquireRequest{RequestID: request.RequestID, ConsumerID: request.ConsumerID, WorkspaceID: request.WorkspaceID, ParentID: request.ParentID, ClientPID: request.ClientPID, Limits: request.Limits})
 				return "acquire", response, err
@@ -149,6 +155,9 @@ func executeParentV2(ctx context.Context, args []string, service v2.Service) (st
 }
 
 func executeWorkspaceV2(ctx context.Context, args []string, service v2.Service) (string, any, error) {
+	if len(args) == 0 {
+		return "workspace", nil, errors.New("usage: workspace status|release --schema 2")
+	}
 	switch args[0] {
 	case "status":
 		flags := newFlagSet("workspace status")
@@ -170,6 +179,10 @@ func executeWorkspaceV2(ctx context.Context, args []string, service v2.Service) 
 	default:
 		return args[0], nil, fmt.Errorf("unknown workspace operation %q", args[0])
 	}
+}
+
+func invalidV2Response(requestID, operation string, err error) v2.Response {
+	return v2.Response{SchemaVersion: v2.SchemaVersion, RequestID: requestID, OK: false, Error: &v2.Error{Code: "invalid-request", Operation: operation, Message: err.Error()}}
 }
 
 func readRequestData(args []string, stdin io.Reader) ([]byte, error) {

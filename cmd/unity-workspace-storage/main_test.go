@@ -73,6 +73,22 @@ func TestCommandParseErrorUsesRequestedSchema(t *testing.T) {
 	}
 }
 
+func TestTopLevelSchema2DecodeErrorReturnsTypedResponse(t *testing.T) {
+	input := `{"schemaVersion":2,"operation":"workspace-acquire","requestId":"bad-v2","unexpected":true}`
+	operation, result, err := executeTop(context.Background(), []string{"workspace", "acquire"}, strings.NewReader(input), &fakeLifecycle{}, v2.Service{})
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	response, ok := result.(v2.Response)
+	if !ok || response.SchemaVersion != 2 || response.RequestID != "bad-v2" || response.Error == nil || response.Error.Code != "invalid-request" {
+		t.Fatalf("operation=%s response=%#v", operation, result)
+	}
+	formatted, ok := commandErrorValue([]string{"workspace", "acquire"}, operation, result, err).(v2.Response)
+	if !ok || formatted.SchemaVersion != 2 || formatted.Error == nil || formatted.Error.Code != "invalid-request" {
+		t.Fatalf("formatted=%#v", formatted)
+	}
+}
+
 func (fake *fakeLifecycle) Acquire(_ context.Context, request contract.AcquireRequest) (contract.AcquireResponse, error) {
 	fake.acquire = request
 	return contract.AcquireResponse{SchemaVersion: contract.SchemaVersion}, nil

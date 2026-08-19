@@ -95,6 +95,7 @@ type parentReceipt struct {
 }
 
 type leaseJournal struct {
+	SchemaVersion int `json:"schemaVersion"`
 	v2.Lease
 	ChildPath     string                     `json:"childPath"`
 	ClientPID     int                        `json:"clientPid"`
@@ -124,6 +125,7 @@ type Manager struct {
 	manualRecovery bool
 	snapshotLease  func(storage.Lease) (storage.UnixLeaseSnapshot, error)
 	recoverLease   func(storage.UnixLeaseSnapshot) (storage.Lease, error)
+	writeLeaseJSON func(string, any) error
 }
 
 type requestRecord struct {
@@ -146,7 +148,7 @@ func NewManager(ctx context.Context, config Config, backend storage.Backend) (*M
 			return nil, fmt.Errorf("unsafe real directory required: %s", path)
 		}
 	}
-	m := &Manager{config: config, backend: backend, bootID: platformBootID(), leases: map[string]storage.Lease{}, requests: map[string]requestRecord{}, snapshotLease: storage.SnapshotUnixLease, recoverLease: storage.RecoverUnixLease}
+	m := &Manager{config: config, backend: backend, bootID: platformBootID(), leases: map[string]storage.Lease{}, requests: map[string]requestRecord{}, snapshotLease: storage.SnapshotUnixLease, recoverLease: storage.RecoverUnixLease, writeLeaseJSON: writeJSON}
 	m.capability = v2.Capability{Platform: runtime.GOOS, Provider: backend.Provider(), ArtifactKind: "directory", RequiresElevation: false, Transport: "unix-socket"}
 	if err := m.probe(ctx); err != nil {
 		m.capability.Error = err.Error()
@@ -263,7 +265,9 @@ func (m *Manager) parentCommit(request v2.Request, fail failFunc) v2.Response {
 			m.manualRecovery = true
 			return fail("parent-corrupt", errors.Join(parentErr, verifyErr, errors.New("committed parent receipt is not valid")))
 		}
-		cleanupPendingTransaction(filepath.Join(m.config.StoreRoot, "pending", request.TransactionID))
+		if cleanupErr := m.cleanupPendingTransaction(request.TransactionID); cleanupErr != nil {
+			return fail("parent-commit-failed", cleanupErr)
+		}
 		return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
 	}
 	if !os.IsNotExist(receiptErr) {
@@ -284,7 +288,9 @@ func (m *Manager) parentCommit(request v2.Request, fail failFunc) v2.Response {
 				if receiptErr := m.writeParentReceipt(request.TransactionID, parentID); receiptErr != nil {
 					return fail("parent-commit-failed", receiptErr)
 				}
-				cleanupPendingTransaction(dir)
+				if cleanupErr := m.cleanupPendingTransaction(request.TransactionID); cleanupErr != nil {
+					return fail("parent-commit-failed", cleanupErr)
+				}
 				return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &existing.Parent}
 			}
 		}
@@ -342,7 +348,9 @@ func (m *Manager) parentCommit(request v2.Request, fail failFunc) v2.Response {
 	if err := m.writeParentReceipt(request.TransactionID, parentID); err != nil {
 		return fail("parent-commit-failed", err)
 	}
-	cleanupPendingTransaction(dir)
+	if cleanupErr := m.cleanupPendingTransaction(request.TransactionID); cleanupErr != nil {
+		return fail("parent-commit-failed", cleanupErr)
+	}
 	return v2.Response{SchemaVersion: 2, RequestID: request.RequestID, OK: true, Provider: m.backend.Provider(), Parent: &parent.Parent}
 }
 
@@ -374,7 +382,10 @@ func (m *Manager) acquire(ctx context.Context, request v2.Request, fail failFunc
 		_ = m.quarantineParent(parent)
 		return fail("parent-corrupt", err)
 	}
-	status := m.measureStatus()
+	status, err := m.measureStatus()
+	if err != nil {
+		return fail("status-unavailable", err)
+	}
 	reserve := m.config.ChildReserveBytes
 	quota := m.config.QuotaBytes
 	if request.Limits.StoreMaxAllocatedBytes > 0 && request.Limits.StoreMaxAllocatedBytes < quota {
@@ -392,37 +403,63 @@ func (m *Manager) acquire(ctx context.Context, request v2.Request, fail failFunc
 	if err := validateWorkspace(m.config.WorkspaceRoot, workspacePath, mountPath); err != nil {
 		return fail("invalid-workspace", err)
 	}
-	leaseID, _ := randomID("lease")
-	ownerToken, _ := randomID("owner")
+	leaseID, err := randomID("lease")
+	if err != nil {
+		return fail("lease-create-failed", err)
+	}
+	ownerToken, err := randomID("owner")
+	if err != nil {
+		return fail("lease-create-failed", err)
+	}
 	childPath := filepath.Join(m.config.StoreRoot, "children", leaseID)
 	owner := workspaceOwner{SchemaVersion: 2, LeaseID: leaseID, WorkspaceID: request.WorkspaceID, WorkspacePath: workspacePath, MountPath: mountPath, OwnerToken: ownerToken}
 	if err := writeJSONExclusive(filepath.Join(workspacePath, workspaceOwnerFile), owner); err != nil {
 		return fail("workspace-owner-write-failed", err)
 	}
-	journal := leaseJournal{Lease: v2.Lease{LeaseID: leaseID, ConsumerID: request.ConsumerID, WorkspaceID: request.WorkspaceID, ParentID: request.ParentID, WorkspacePath: workspacePath, MountPath: mountPath, State: "requested", CreatedAt: time.Now().UTC()}, ChildPath: childPath, ClientPID: request.ClientPID, BootSessionID: m.bootID, OwnerToken: ownerToken, UpdatedAt: time.Now().UTC()}
+	journal := leaseJournal{SchemaVersion: 2, Lease: v2.Lease{LeaseID: leaseID, ConsumerID: request.ConsumerID, WorkspaceID: request.WorkspaceID, ParentID: request.ParentID, WorkspacePath: workspacePath, MountPath: mountPath, State: "requested", CreatedAt: time.Now().UTC()}, ChildPath: childPath, ClientPID: request.ClientPID, BootSessionID: m.bootID, OwnerToken: ownerToken, UpdatedAt: time.Now().UTC()}
 	journalPath := filepath.Join(m.config.StoreRoot, "leases", leaseID+".json")
-	if err := writeJSON(journalPath, journal); err != nil {
-		return fail("journal-write-failed", err)
+	if err := m.writeLeaseJSON(journalPath, journal); err != nil {
+		cleanupErr := removeWorkspaceOwner(&journal)
+		if cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			m.manualRecovery = true
+		}
+		return fail("journal-write-failed", errors.Join(err, cleanupErr))
 	}
 	started := time.Now()
 	lease, raw, err := m.backend.Acquire(ctx, storage.AcquireRequest{ParentPath: parent.DataPath, ChildPath: childPath, MountPath: mountPath, StoreRoot: filepath.Join(m.config.StoreRoot, "children"), LeaseID: leaseID}, nil)
 	if err != nil {
-		_ = os.Remove(filepath.Join(workspacePath, workspaceOwnerFile))
-		if _, statErr := os.Lstat(childPath); os.IsNotExist(statErr) {
-			_ = os.Remove(journalPath)
+		var cleanupErr error
+		_, childErr := os.Lstat(childPath)
+		_, mountErr := os.Lstat(mountPath)
+		if os.IsNotExist(childErr) && os.IsNotExist(mountErr) {
+			ownerErr := removeWorkspaceOwner(&journal)
+			if ownerErr != nil && !os.IsNotExist(ownerErr) {
+				cleanupErr = errors.Join(cleanupErr, ownerErr)
+			}
+			if cleanupErr == nil {
+				cleanupErr = removeFileIfExists(journalPath)
+			}
+		} else {
+			m.manualRecovery = true
+			if childErr != nil && !os.IsNotExist(childErr) {
+				cleanupErr = errors.Join(cleanupErr, childErr)
+			}
+			if mountErr != nil && !os.IsNotExist(mountErr) {
+				cleanupErr = errors.Join(cleanupErr, mountErr)
+			}
+			cleanupErr = errors.Join(cleanupErr, errors.New("backend acquire left uncertain child or mount state"))
 		}
-		return fail(storageErrorCode(err), err)
+		return fail(storageErrorCode(err), errors.Join(err, cleanupErr))
 	}
 	snapshot, err := m.snapshotLease(lease)
 	if err != nil {
-		return fail("journal-write-failed", err)
+		return fail("journal-write-failed", errors.Join(err, m.rollbackAcquiredLease(journalPath, &journal, lease)))
 	}
 	journal.State = "ready"
 	journal.Snapshot = &snapshot
 	journal.UpdatedAt = time.Now().UTC()
-	if err := writeJSON(journalPath, journal); err != nil {
-		_, _ = lease.Release(context.Background(), true, nil)
-		return fail("journal-write-failed", err)
+	if err := m.writeLeaseJSON(journalPath, journal); err != nil {
+		return fail("journal-write-failed", errors.Join(err, m.rollbackAcquiredLease(journalPath, &journal, lease)))
 	}
 	m.leases[leaseID] = lease
 	metrics := metricsFromStorage(raw)
@@ -460,9 +497,13 @@ func (m *Manager) release(ctx context.Context, request v2.Request, fail failFunc
 		return fail(storageErrorCode(err), err)
 	}
 	if err := removeWorkspaceOwner(journal); err != nil {
+		m.manualRecovery = true
 		return fail("workspace-cleanup-failed", err)
 	}
-	_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", request.LeaseID+".json"))
+	if err := removeFileIfExists(filepath.Join(m.config.StoreRoot, "leases", request.LeaseID+".json")); err != nil {
+		m.manualRecovery = true
+		return fail("journal-remove-failed", err)
+	}
 	delete(m.leases, request.LeaseID)
 	journal.State = "released"
 	metrics := metricsFromStorage(raw)
@@ -471,24 +512,45 @@ func (m *Manager) release(ctx context.Context, request v2.Request, fail failFunc
 }
 
 func (m *Manager) status(requestID string) v2.Response {
-	s := m.measureStatus()
+	s, err := m.measureStatus()
+	if err != nil {
+		return v2.Response{SchemaVersion: 2, RequestID: requestID, OK: false, Provider: m.backend.Provider(), Error: &v2.Error{Code: "status-unavailable", Operation: v2.OperationStatus, Message: err.Error()}}
+	}
 	return v2.Response{SchemaVersion: 2, RequestID: requestID, OK: true, Provider: m.backend.Provider(), Status: &s}
 }
 
-func (m *Manager) measureStatus() v2.Status {
-	usage, _ := fileusage.MeasureDirectoryUsage(m.config.StoreRoot)
-	free, _ := hostFreeBytes(m.config.StoreRoot)
-	parents, _ := os.ReadDir(filepath.Join(m.config.StoreRoot, "parents"))
-	leases, _ := os.ReadDir(filepath.Join(m.config.StoreRoot, "leases"))
-	quarantine, _ := os.ReadDir(filepath.Join(m.config.StoreRoot, "quarantine"))
-	children, _ := os.ReadDir(filepath.Join(m.config.StoreRoot, "children"))
+func (m *Manager) measureStatus() (v2.Status, error) {
+	usage, err := fileusage.MeasureDirectoryUsage(m.config.StoreRoot)
+	if err != nil {
+		return v2.Status{}, err
+	}
+	free, err := hostFreeBytes(m.config.StoreRoot)
+	if err != nil {
+		return v2.Status{}, err
+	}
+	parents, err := os.ReadDir(filepath.Join(m.config.StoreRoot, "parents"))
+	if err != nil {
+		return v2.Status{}, err
+	}
+	leases, err := os.ReadDir(filepath.Join(m.config.StoreRoot, "leases"))
+	if err != nil {
+		return v2.Status{}, err
+	}
+	quarantine, err := os.ReadDir(filepath.Join(m.config.StoreRoot, "quarantine"))
+	if err != nil {
+		return v2.Status{}, err
+	}
+	children, err := os.ReadDir(filepath.Join(m.config.StoreRoot, "children"))
+	if err != nil {
+		return v2.Status{}, err
+	}
 	quarantineCount := len(quarantine)
 	for _, entry := range children {
 		if strings.HasPrefix(entry.Name(), ".testplay-delete-") {
 			quarantineCount++
 		}
 	}
-	return v2.Status{Capability: m.capability, ParentCount: len(parents), ActiveLeaseCount: len(leases), QuarantineCount: quarantineCount, AllocatedBytes: usage.AllocatedBytes, QuotaBytes: m.config.QuotaBytes, HostFreeBytes: free, HostFloorBytes: m.config.HostFloorBytes, ManualRecoveryRequired: m.manualRecovery}
+	return v2.Status{Capability: m.capability, ParentCount: len(parents), ActiveLeaseCount: len(leases), QuarantineCount: quarantineCount, AllocatedBytes: usage.AllocatedBytes, QuotaBytes: m.config.QuotaBytes, HostFreeBytes: free, HostFloorBytes: m.config.HostFloorBytes, ManualRecoveryRequired: m.manualRecovery}, nil
 }
 
 func (m *Manager) probe(ctx context.Context) error {
@@ -526,19 +588,36 @@ func (m *Manager) recover(ctx context.Context) error {
 			continue
 		}
 		var journal leaseJournal
-		if err := readJSON(filepath.Join(m.config.StoreRoot, "leases", entry.Name()), &journal); err != nil {
+		journalPath := filepath.Join(m.config.StoreRoot, "leases", entry.Name())
+		if err := readJSON(journalPath, &journal); err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
-		if journal.Snapshot == nil {
-			if _, err := os.Lstat(journal.ChildPath); os.IsNotExist(err) {
-				if ownerErr := removeWorkspaceOwner(&journal); ownerErr != nil && !os.IsNotExist(ownerErr) {
-					result = errors.Join(result, ownerErr)
-					continue
-				}
-				_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", entry.Name()))
+		if err := m.validateLeaseJournal(entry.Name(), &journal); err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		if _, childErr := os.Lstat(journal.ChildPath); os.IsNotExist(childErr) {
+			if _, mountErr := os.Lstat(journal.MountPath); mountErr == nil {
+				result = errors.Join(result, errors.New("lease child is absent while workspace mount remains"))
+				continue
+			} else if !os.IsNotExist(mountErr) {
+				result = errors.Join(result, mountErr)
 				continue
 			}
+			if ownerErr := removeWorkspaceOwner(&journal); ownerErr != nil && !os.IsNotExist(ownerErr) {
+				result = errors.Join(result, ownerErr)
+				continue
+			}
+			if removeErr := removeFileIfExists(journalPath); removeErr != nil {
+				result = errors.Join(result, removeErr)
+			}
+			continue
+		} else if childErr != nil {
+			result = errors.Join(result, childErr)
+			continue
+		}
+		if journal.Snapshot == nil {
 			result = errors.Join(result, errors.New("partial lease lacks ownership snapshot"))
 			continue
 		}
@@ -549,6 +628,10 @@ func (m *Manager) recover(ctx context.Context) error {
 		}
 		alive := journal.BootSessionID == m.bootID && processAlive(journal.ClientPID)
 		if alive {
+			if err := validateWorkspaceOwner(&journal); err != nil {
+				result = errors.Join(result, err)
+				continue
+			}
 			m.leases[journal.LeaseID] = lease
 			continue
 		}
@@ -564,7 +647,9 @@ func (m *Manager) recover(ctx context.Context) error {
 			result = errors.Join(result, err)
 			continue
 		}
-		_ = os.Remove(filepath.Join(m.config.StoreRoot, "leases", entry.Name()))
+		if err := removeFileIfExists(journalPath); err != nil {
+			result = errors.Join(result, err)
+		}
 	}
 	return result
 }
@@ -605,10 +690,37 @@ func (m *Manager) readLease(id string) (*leaseJournal, error) {
 	if err != nil {
 		return nil, err
 	}
-	if j.LeaseID != id {
-		return nil, errors.New("lease identity mismatch")
+	if err := m.validateLeaseJournal(id+".json", &j); err != nil {
+		return nil, err
 	}
 	return &j, nil
+}
+
+func (m *Manager) validateLeaseJournal(entryName string, journal *leaseJournal) error {
+	if journal.SchemaVersion != 2 || entryName != journal.LeaseID+".json" ||
+		!identifier.MatchString(journal.LeaseID) || !identifier.MatchString(journal.ConsumerID) ||
+		!identifier.MatchString(journal.WorkspaceID) || !identifier.MatchString(journal.ParentID) ||
+		!identifier.MatchString(journal.OwnerToken) || journal.BootSessionID == "" {
+		return errors.New("lease journal identity mismatch")
+	}
+	workspacePath := filepath.Join(m.config.WorkspaceRoot, journal.WorkspaceID)
+	mountPath := filepath.Join(workspacePath, "Library")
+	childPath := filepath.Join(m.config.StoreRoot, "children", journal.LeaseID)
+	if filepath.Clean(journal.WorkspacePath) != workspacePath || filepath.Clean(journal.MountPath) != mountPath || filepath.Clean(journal.ChildPath) != childPath {
+		return errors.New("lease journal path escapes configured ownership roots")
+	}
+	if journal.Snapshot == nil {
+		return nil
+	}
+	snapshot := journal.Snapshot
+	parentPath := filepath.Join(m.config.StoreRoot, "parents", journal.ParentID, "data")
+	if filepath.Clean(snapshot.StoreRoot) != filepath.Join(m.config.StoreRoot, "children") ||
+		filepath.Clean(snapshot.ParentPath) != parentPath || filepath.Clean(snapshot.ChildPath) != childPath ||
+		filepath.Clean(snapshot.MountPath) != mountPath || snapshot.LeaseID != journal.LeaseID ||
+		!identifier.MatchString(snapshot.OwnerToken) {
+		return errors.New("lease recovery snapshot path or identity mismatch")
+	}
+	return nil
 }
 func (m *Manager) readParentReceipt(transactionID string) (parentReceipt, error) {
 	var receipt parentReceipt
@@ -761,7 +873,10 @@ func digestTree(root string) (string, int64, error) {
 		if err != nil {
 			return "", 0, err
 		}
-		info, _ := f.Stat()
+		info, statErr := f.Stat()
+		if statErr != nil {
+			return "", 0, errors.Join(statErr, f.Close())
+		}
 		logical += info.Size()
 		var size [8]byte
 		binary.BigEndian.PutUint64(size[:], uint64(info.Size()))
@@ -780,9 +895,52 @@ func writeDigestField(writer io.Writer, value []byte) {
 	_, _ = writer.Write(size[:])
 	_, _ = writer.Write(value)
 }
-func cleanupPendingTransaction(dir string) {
-	_ = os.Remove(filepath.Join(dir, "pending.json"))
-	_ = os.Remove(dir)
+func (m *Manager) cleanupPendingTransaction(transactionID string) error {
+	if !identifier.MatchString(transactionID) {
+		return errors.New("invalid pending transaction identity")
+	}
+	dir := filepath.Join(m.config.StoreRoot, "pending", transactionID)
+	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("pending transaction is not a real directory")
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		return errors.Join(err, errors.New("pending transaction remains after cleanup"))
+	}
+	return nil
+}
+
+func (m *Manager) rollbackAcquiredLease(journalPath string, journal *leaseJournal, lease storage.Lease) error {
+	if _, err := lease.Release(context.Background(), true, nil); err != nil {
+		m.manualRecovery = true
+		return err
+	}
+	if err := removeWorkspaceOwner(journal); err != nil {
+		m.manualRecovery = true
+		return err
+	}
+	if err := removeFileIfExists(journalPath); err != nil {
+		m.manualRecovery = true
+		return err
+	}
+	return nil
+}
+
+func removeFileIfExists(path string) error {
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 func writeJSON(path string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")
