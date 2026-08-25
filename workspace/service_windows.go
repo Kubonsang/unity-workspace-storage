@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-const WindowsServiceName = "TestPlayStorageBroker"
+const WindowsServiceName = "UnityWorkspaceStorage"
 
 func RunWindowsService(configPath string) error {
 	config, err := LoadServiceConfig(configPath)

@@ -51,8 +51,8 @@ them would invalidate RC parity or existing recovery artifacts:
 - provider: `vhdx-differencing`;
 - broker protocol schema: `2`;
 - parent metadata schema: `2`;
-- default pipe: `\\.\pipe\testplay-storage-broker-v2`;
-- Windows service name: `TestPlayStorageBroker`;
+- default pipe: `\\.\pipe\unity-workspace-storage-v2`;
+- Windows service name: `UnityWorkspaceStorage`;
 - workspace owner marker: `.testplay-vhdx-workspace-owner.json`;
 - Unix ownership/quarantine markers and VHDX volume labels carrying the
   historical TestPlay prefix;

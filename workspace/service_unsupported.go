@@ -4,7 +4,7 @@ package workspace
 
 import "context"
 
-const WindowsServiceName = "TestPlayStorageBroker"
+const WindowsServiceName = "UnityWorkspaceStorage"
 
 func RunWindowsService(string) error                 { return ErrBrokerUnavailable }
 func RunBrokerConsole(context.Context, string) error { return ErrBrokerUnavailable }
