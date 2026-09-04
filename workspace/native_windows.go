@@ -270,6 +270,48 @@ func (s *windowsChildSession) Usage() (int64, error) {
 	return usage.AllocatedBytes, err
 }
 
+func (s *windowsChildSession) PrepareRemoval(ctx context.Context) (ChildRemoval, error) {
+	preparer, ok := s.backend.(storage.RemovalPreparer)
+	if !ok {
+		return nil, fmt.Errorf("%w: storage lease does not support removal reservations", ErrBrokerUnavailable)
+	}
+	reservation, err := preparer.PrepareRemoval(ctx)
+	if err != nil {
+		var storageErr *storage.Error
+		if errors.As(err, &storageErr) && storageErr.Code == storage.CodeVolumeInUse {
+			return nil, errors.Join(ErrVolumeInUse, err)
+		}
+		return nil, err
+	}
+	return &windowsChildRemoval{backend: reservation, path: s.path}, nil
+}
+
+type windowsChildRemoval struct {
+	backend storage.RemovalReservation
+	path    string
+}
+
+func (removal *windowsChildRemoval) Abort() error { return removal.backend.Abort() }
+
+func (removal *windowsChildRemoval) Commit(ctx context.Context) (Metrics, error) {
+	started := time.Now()
+	raw, err := removal.backend.Commit(ctx, nil)
+	metrics := Metrics{CleanupState: CleanupReleased, ChildReleaseMs: time.Since(started).Milliseconds()}
+	if raw.ReleaseWallClockMs != nil {
+		metrics.ChildReleaseMs = *raw.ReleaseWallClockMs
+	}
+	if raw.ChildReleasedAllocatedBytes != nil {
+		metrics.ChildReleasedBytes = *raw.ChildReleasedAllocatedBytes
+		metrics.ChildReleasedMeasured = true
+	} else if _, statErr := os.Lstat(removal.path); os.IsNotExist(statErr) {
+		metrics.ChildReleasedMeasured = true
+	}
+	if err != nil {
+		metrics.CleanupState = CleanupUncertain
+	}
+	return metrics, err
+}
+
 func (s *windowsChildSession) Release(ctx context.Context, deleteChild bool) (Metrics, error) {
 	started := time.Now()
 	metrics := Metrics{}

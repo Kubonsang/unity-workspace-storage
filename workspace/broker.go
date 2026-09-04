@@ -19,6 +19,7 @@ type BrokerConfig struct {
 	HostFloorBytes    int64
 	ChildReserveBytes int64
 	ParentTTL         time.Duration
+	RemovalTTL        time.Duration
 }
 
 type Broker struct {
@@ -31,6 +32,7 @@ type Broker struct {
 	children map[string]ChildSession
 	requests map[string]Response
 	inflight map[string]chan struct{}
+	removals map[string]*retainedRemoval
 	now      func() time.Time
 }
 
@@ -162,6 +164,9 @@ func NewBroker(config BrokerConfig, native Native) (*Broker, error) {
 	if config.ParentTTL == 0 {
 		config.ParentTTL = 30 * 24 * time.Hour
 	}
+	if config.RemovalTTL == 0 {
+		config.RemovalTTL = 5 * time.Minute
+	}
 	if config.QuotaBytes < 0 || config.HostFloorBytes < 0 || config.ChildReserveBytes < 0 {
 		return nil, ErrInvalidInput
 	}
@@ -172,7 +177,7 @@ func NewBroker(config BrokerConfig, native Native) (*Broker, error) {
 	if native == nil {
 		native = NewNative()
 	}
-	return &Broker{config: config, store: store, native: native, parents: map[string]ParentSession{}, pending: map[string]*PendingParent{}, children: map[string]ChildSession{}, requests: map[string]Response{}, inflight: map[string]chan struct{}{}, now: time.Now}, nil
+	return &Broker{config: config, store: store, native: native, parents: map[string]ParentSession{}, pending: map[string]*PendingParent{}, children: map[string]ChildSession{}, requests: map[string]Response{}, inflight: map[string]chan struct{}{}, removals: map[string]*retainedRemoval{}, now: time.Now}, nil
 }
 
 func (b *Broker) Handle(ctx context.Context, callerSID string, request Request) Response {
@@ -242,7 +247,7 @@ func (b *Broker) handleLocked(ctx context.Context, callerSID string, request Req
 	}
 	switch request.Operation {
 	case OperationHello:
-		return Response{SchemaVersion: ProtocolSchemaVersion, RequestID: request.RequestID, OK: true, Provider: Provider, BrokerVersion: "v2", WorkspaceRoot: b.config.WorkspaceRoot, StoreRoot: b.config.StoreRoot}
+		return Response{SchemaVersion: ProtocolSchemaVersion, RequestID: request.RequestID, OK: true, Provider: Provider, BrokerVersion: "v3", WorkspaceRoot: b.config.WorkspaceRoot, StoreRoot: b.config.StoreRoot}
 	case OperationBeginParentBuild:
 		return b.beginParent(ctx, request, fail)
 	case OperationCommitParent:
@@ -257,8 +262,12 @@ func (b *Broker) handleLocked(ctx context.Context, callerSID string, request Req
 		return b.release(ctx, request, fail)
 	case OperationAttachRetained:
 		return b.attachRetained(ctx, request, fail)
-	case OperationRemoveRetained:
-		return b.removeRetained(ctx, request, fail)
+	case OperationPrepareRetainedRemoval:
+		return b.prepareRetainedRemoval(ctx, request, fail)
+	case OperationCommitRetainedRemoval:
+		return b.commitRetainedRemoval(ctx, request, fail)
+	case OperationAbortRetainedRemoval:
+		return b.abortRetainedRemoval(request, fail)
 	case OperationStatus:
 		return b.status(request, fail)
 	case OperationAdmit:
@@ -300,7 +309,7 @@ func (b *Broker) attachRetained(ctx context.Context, request Request, fail failu
 	if err != nil {
 		return fail("invalid-workspace", "attach-retained", request.WorkspaceID, err)
 	}
-	if err := b.validateWorkspaceMount(request.WorkspaceID, mount); err != nil {
+	if err := b.validateWorkspaceContainer(request.WorkspaceID, mount); err != nil {
 		return fail("invalid-workspace", "validate-retained-mount", mount, err)
 	}
 	journal.MountPath = mount
@@ -317,55 +326,6 @@ func (b *Broker) attachRetained(ctx context.Context, request Request, fail failu
 	b.children[record.LeaseID] = session
 	b.mu.Unlock()
 	lease := session.Info()
-	return Response{SchemaVersion: ProtocolSchemaVersion, RequestID: request.RequestID, OK: true, Provider: Provider, Lease: &lease, Metrics: &metrics}
-}
-
-func (b *Broker) removeRetained(ctx context.Context, request Request, fail failureBuilder) Response {
-	record, err := b.store.ReadRetained(request.RunID)
-	if err != nil {
-		return fail("retained-not-found", "remove-retained", request.RunID, err)
-	}
-	journal, err := b.store.ReadLease(record.LeaseID)
-	if err != nil || !journal.Retained || journal.OwnershipToken != record.OwnershipToken || journal.ChildPath != record.ChildPath {
-		return fail("retained-identity-mismatch", "remove-retained", record.ChildPath, errors.Join(err, ErrOwnershipMismatch))
-	}
-	b.mu.Lock()
-	session := b.children[record.LeaseID]
-	b.mu.Unlock()
-	if session == nil {
-		resolved, resolveErr := b.store.ResolveParent(CompatibilityKey{SchemaVersion: ParentSchemaVersion, Digest: record.ParentKey})
-		if resolveErr != nil || resolved.Status != ParentStatusValid || resolved.Metadata == nil {
-			return fail("parent-unavailable", "remove-retained", record.ParentKey, errors.Join(resolveErr, ErrOwnershipMismatch))
-		}
-		if verifyErr := b.native.VerifyParent(ctx, *resolved.Metadata); verifyErr != nil {
-			return fail("parent-corrupt", "remove-retained", record.ParentKey, verifyErr)
-		}
-		session, _, err = b.native.AttachChild(ctx, *resolved.Metadata, *journal)
-		if err != nil {
-			return fail("retained-attach-failed", "remove-retained", record.ChildPath, err)
-		}
-	}
-	metrics, err := session.Release(ctx, true)
-	if err != nil {
-		return fail("retained-release-failed", "remove-retained", record.ChildPath, err)
-	}
-	if err := b.cleanupOwnedWorkspace(*journal); err != nil {
-		journal.State = "quarantined"
-		_ = b.store.WriteLease(*journal)
-		return fail("workspace-cleanup-failed", "remove-retained", journal.WorkspacePath, err)
-	}
-	if err := b.store.RemoveLease(*journal); err != nil {
-		return fail("journal-remove-failed", "remove-retained", record.ChildPath, err)
-	}
-	if err := b.store.RemoveRetained(*record); err != nil {
-		return fail("retained-record-remove-failed", "remove-retained", record.ChildPath, err)
-	}
-	b.mu.Lock()
-	delete(b.children, record.LeaseID)
-	b.mu.Unlock()
-	lease := session.Info()
-	lease.State = "released"
-	lease.Retained = false
 	return Response{SchemaVersion: ProtocolSchemaVersion, RequestID: request.RequestID, OK: true, Provider: Provider, Lease: &lease, Metrics: &metrics}
 }
 
@@ -588,6 +548,12 @@ func (b *Broker) release(ctx context.Context, request Request, fail failureBuild
 	journal, err := b.store.ReadLease(request.LeaseID)
 	if err != nil {
 		return fail("lease-not-found", "release", request.LeaseID, err)
+	}
+	b.mu.Lock()
+	removal := b.removals[journal.RunID]
+	b.mu.Unlock()
+	if removal != nil {
+		return fail("removal-transaction-conflict", "release", request.LeaseID, ErrParentConflict)
 	}
 	journal.State = "releasing"
 	journal.Retained = request.RetainChild
@@ -829,25 +795,43 @@ func (b *Broker) cleanupOwnedWorkspace(journal LeaseJournal) error {
 	} else if err != nil {
 		return err
 	}
-	if _, err := b.readWorkspaceOwner(journal); err != nil {
+	marker, err := b.readWorkspaceOwner(journal)
+	if err != nil {
 		return err
 	}
-	if err := filepath.Walk(journal.WorkspacePath, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	if info, mountErr := os.Lstat(journal.MountPath); mountErr == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: Library mount is not a real directory: %s", ErrOwnershipMismatch, journal.MountPath)
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: workspace entry is a symlink: %s", ErrOwnershipMismatch, path)
+		if err := validatePlatformNonReparse(journal.MountPath); err != nil {
+			return err
 		}
-		return validatePlatformNonReparse(path)
-	}); err != nil {
+		entries, err := os.ReadDir(journal.MountPath)
+		if err != nil || len(entries) != 0 {
+			return errors.Join(err, fmt.Errorf("%w: Library mount directory is not empty", ErrOwnershipMismatch))
+		}
+		if err := os.Remove(journal.MountPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(mountErr) {
+		return mountErr
+	}
+	if marker != "" {
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	entries, err := os.ReadDir(journal.WorkspacePath)
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.RemoveAll(journal.WorkspacePath); err != nil {
-		return err
+	// The broker owns only its marker and the Library mount. Git worktree
+	// contents are user-authored data and are never recursively removed here.
+	if len(entries) != 0 {
+		return nil
 	}
-	if _, err := os.Lstat(journal.WorkspacePath); !os.IsNotExist(err) {
-		return errors.Join(err, ErrOwnershipMismatch)
+	if err := os.Remove(journal.WorkspacePath); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }
@@ -865,6 +849,18 @@ func (b *Broker) workspaceMount(workspaceID string) (string, string, error) {
 }
 
 func (b *Broker) validateWorkspaceMount(workspaceID, mount string) error {
+	if err := b.validateWorkspaceContainer(workspaceID, mount); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(mount); err == nil {
+		return fmt.Errorf("%w: Library mount path already exists: %s", ErrInvalidInput, mount)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (b *Broker) validateWorkspaceContainer(workspaceID, mount string) error {
 	workspace, expectedMount, err := b.workspaceMount(workspaceID)
 	if err != nil || !samePath(expectedMount, mount) {
 		return errors.Join(err, ErrInvalidInput)
@@ -877,11 +873,6 @@ func (b *Broker) validateWorkspaceMount(workspaceID, mount string) error {
 		if platformErr := validatePlatformRealDirectory(path); platformErr != nil {
 			return platformErr
 		}
-	}
-	if _, err := os.Lstat(mount); err == nil {
-		return fmt.Errorf("%w: Library mount path already exists: %s", ErrInvalidInput, mount)
-	} else if !os.IsNotExist(err) {
-		return err
 	}
 	return nil
 }

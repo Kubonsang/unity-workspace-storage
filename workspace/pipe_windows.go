@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const DefaultPipeName = `\\.\pipe\unity-workspace-storage-v2`
+const DefaultPipeName = `\\.\pipe\unity-workspace-storage-v3`
 
 const pipeMode = windows.PIPE_TYPE_MESSAGE | windows.PIPE_READMODE_MESSAGE | windows.PIPE_WAIT | windows.PIPE_REJECT_REMOTE_CLIENTS
 

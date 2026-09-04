@@ -58,6 +58,7 @@ const (
 	CodeDevDriveVerificationFailed        = "dev-drive-verification-failed"
 	CodeTemporaryDriveLetterUnavailable   = "temporary-drive-letter-unavailable"
 	CodeTemporaryDriveLetterCleanupFailed = "temporary-drive-letter-cleanup-failed"
+	CodeVolumeInUse                       = "volume-in-use"
 )
 
 const (
@@ -172,6 +173,19 @@ type Metrics struct {
 type Lease interface {
 	Info() LeaseInfo
 	Release(context.Context, bool, ProgressFunc) (Metrics, error)
+}
+
+// RemovalPreparer is implemented by leases that can prove exclusive access to
+// their mounted filesystem before any destructive cleanup begins.
+type RemovalPreparer interface {
+	PrepareRemoval(context.Context) (RemovalReservation, error)
+}
+
+// RemovalReservation holds the platform-specific exclusivity proof until the
+// caller either commits the exact child removal or aborts without mutation.
+type RemovalReservation interface {
+	Commit(context.Context, ProgressFunc) (Metrics, error)
+	Abort() error
 }
 
 type Backend interface {

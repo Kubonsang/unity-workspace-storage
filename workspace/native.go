@@ -25,6 +25,12 @@ type ChildSession interface {
 	FileIdentity() FileIdentity
 	Usage() (int64, error)
 	Release(context.Context, bool) (Metrics, error)
+	PrepareRemoval(context.Context) (ChildRemoval, error)
+}
+
+type ChildRemoval interface {
+	Commit(context.Context) (Metrics, error)
+	Abort() error
 }
 
 type Native interface {

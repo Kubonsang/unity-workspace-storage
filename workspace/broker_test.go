@@ -24,6 +24,8 @@ type fakeNative struct {
 	attachErr   error
 	bootSession string
 	livePIDs    map[int]bool
+	attachCalls int
+	prepareErr  error
 }
 
 func (native *fakeNative) event(value string) {
@@ -82,6 +84,9 @@ func (native *fakeNative) AcquireChild(_ context.Context, parent ParentMetadata,
 	return &fakeChildSession{lease: lease, childPath: journal.ChildPath, identity: FileIdentity{FileID: "fake:" + journal.LeaseID}}, Metrics{ChildCreateMs: 1, ChildAttachMs: 2, ChildMountMs: 3, ChildReadyBytes: 5}, nil
 }
 func (native *fakeNative) AttachChild(_ context.Context, parent ParentMetadata, journal LeaseJournal) (ChildSession, Metrics, error) {
+	native.mu.Lock()
+	native.attachCalls++
+	native.mu.Unlock()
 	if native.attachErr != nil {
 		return nil, Metrics{}, native.attachErr
 	}
@@ -92,7 +97,7 @@ func (native *fakeNative) AttachChild(_ context.Context, parent ParentMetadata, 
 		return nil, Metrics{}, err
 	}
 	lease := Lease{LeaseID: journal.LeaseID, RunID: journal.RunID, ParentKey: parent.CompatibilityKey.Digest, MountPath: journal.MountPath, State: "ready", CreatedAt: journal.CreatedAt, Retained: true}
-	return &fakeChildSession{lease: lease, childPath: journal.ChildPath, identity: journal.FileIdentity}, Metrics{ChildAttachMs: 1, ChildMountMs: 1}, nil
+	return &fakeChildSession{lease: lease, childPath: journal.ChildPath, identity: journal.FileIdentity, prepareErr: native.prepareErr}, Metrics{ChildAttachMs: 1, ChildMountMs: 1}, nil
 }
 
 func TestRecoverRecordsAttachFailureEvidence(t *testing.T) {
@@ -153,10 +158,14 @@ func (session *fakeParentSession) Abort(context.Context) error {
 }
 
 type fakeChildSession struct {
-	lease     Lease
-	childPath string
-	identity  FileIdentity
-	released  bool
+	lease        Lease
+	childPath    string
+	identity     FileIdentity
+	released     bool
+	prepareErr   error
+	prepareCalls int
+	abortCalls   int
+	commitCalls  int
 }
 
 func (session *fakeChildSession) Info() Lease                { return session.lease }
@@ -184,6 +193,41 @@ func (session *fakeChildSession) Release(_ context.Context, deleteChild bool) (M
 		state = CleanupReleased
 	}
 	return Metrics{CleanupState: state, ChildReleaseMs: 1}, nil
+}
+
+func (session *fakeChildSession) PrepareRemoval(context.Context) (ChildRemoval, error) {
+	session.prepareCalls++
+	if session.prepareErr != nil {
+		return nil, session.prepareErr
+	}
+	return &fakeChildRemoval{session: session}, nil
+}
+
+type fakeChildRemoval struct {
+	session   *fakeChildSession
+	aborted   bool
+	committed bool
+}
+
+func (removal *fakeChildRemoval) Commit(ctx context.Context) (Metrics, error) {
+	if removal.aborted {
+		return Metrics{}, fmt.Errorf("removal was aborted")
+	}
+	metrics, err := removal.session.Release(ctx, true)
+	if err == nil {
+		removal.committed = true
+		removal.session.commitCalls++
+	}
+	return metrics, err
+}
+
+func (removal *fakeChildRemoval) Abort() error {
+	if removal.committed {
+		return fmt.Errorf("removal was committed")
+	}
+	removal.aborted = true
+	removal.session.abortCalls++
+	return nil
 }
 
 func testBroker(t *testing.T, native *fakeNative) (*Broker, CompatibilityKey, string) {
@@ -265,6 +309,25 @@ func commitTestParent(t *testing.T, broker *Broker, key CompatibilityKey, worksp
 	committed := broker.Handle(context.Background(), "S-1-5-21-test", commit)
 	if !committed.OK || committed.Parent == nil || !committed.Parent.Immutable {
 		t.Fatalf("commit=%+v", committed)
+	}
+}
+
+func removeTestRetained(t *testing.T, broker *Broker, runID, workspaceID string) {
+	t.Helper()
+	prepare := request(OperationPrepareRetainedRemoval, "prepare-remove-"+runID)
+	prepare.RunID = runID
+	prepare.WorkspaceID = workspaceID
+	prepare.TransactionID = "remove-" + runID
+	prepared := broker.Handle(context.Background(), "S-1-5-21-test", prepare)
+	if !prepared.OK || prepared.Removal == nil || prepared.Removal.State != removalPrepared {
+		t.Fatalf("prepare retained=%+v", prepared)
+	}
+	commit := request(OperationCommitRetainedRemoval, "commit-remove-"+runID)
+	commit.RunID = runID
+	commit.TransactionID = prepare.TransactionID
+	committed := broker.Handle(context.Background(), "S-1-5-21-test", commit)
+	if !committed.OK || committed.Removal == nil || committed.Removal.State != removalCommitted {
+		t.Fatalf("commit retained=%+v", committed)
 	}
 }
 
@@ -351,11 +414,7 @@ func TestBrokerRetainedChildAttachAndRemove(t *testing.T) {
 	if response := broker.Handle(context.Background(), "S-1-5-21-test", attach); !response.OK {
 		t.Fatalf("attach=%+v", response)
 	}
-	remove := request(OperationRemoveRetained, "remove-retained")
-	remove.RunID = "retained-run"
-	if response := broker.Handle(context.Background(), "S-1-5-21-test", remove); !response.OK {
-		t.Fatalf("remove=%+v", response)
-	}
+	removeTestRetained(t, broker, "retained-run", "retained-run")
 	if _, err := os.Stat(filepath.Join(workspaces, "retained-run")); !os.IsNotExist(err) {
 		t.Fatalf("retained workspace residual err=%v", err)
 	}
@@ -642,11 +701,14 @@ func TestRecoverRejectsWorkspaceReparseEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Quarantined != 1 || summary.Released != 0 {
+	if summary.Quarantined != 0 || summary.Released != 1 {
 		t.Fatalf("summary=%+v", summary)
 	}
 	if _, err := os.Lstat(workspace); err != nil {
-		t.Fatalf("reparse workspace was removed: %v", err)
+		t.Fatalf("user worktree was removed: %v", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("user reparse entry was removed: %v", err)
 	}
 }
 
@@ -739,11 +801,7 @@ func TestLRUPreservesExpiredParentReferencedByRetainedChild(t *testing.T) {
 	if err != nil || resolved.Status != ParentStatusValid {
 		t.Fatalf("retained parent lost: %+v %v", resolved, err)
 	}
-	remove := request(OperationRemoveRetained, "remove-retained-lru")
-	remove.RunID = "retained-lru"
-	if response := broker.Handle(context.Background(), "S-1-5-21-test", remove); !response.OK {
-		t.Fatalf("remove retained=%+v", response)
-	}
+	removeTestRetained(t, broker, "retained-lru", "retained-lru")
 	if response := broker.Handle(context.Background(), "S-1-5-21-test", request(OperationAdmit, "admit-after-retained-remove")); !response.OK {
 		t.Fatalf("expired unreferenced parent GC failed: %+v", response)
 	}

@@ -6,18 +6,20 @@ import (
 )
 
 const (
-	OperationHello            = "hello"
-	OperationBeginParentBuild = "begin-parent-build"
-	OperationCommitParent     = "commit-parent"
-	OperationAbortParent      = "abort-parent"
-	OperationAcquire          = "acquire"
-	OperationHeartbeat        = "heartbeat"
-	OperationRelease          = "release"
-	OperationAttachRetained   = "attach-retained"
-	OperationRemoveRetained   = "remove-retained"
-	OperationStatus           = "status"
-	OperationAdmit            = "admit"
-	OperationGC               = "gc"
+	OperationHello                  = "hello"
+	OperationBeginParentBuild       = "begin-parent-build"
+	OperationCommitParent           = "commit-parent"
+	OperationAbortParent            = "abort-parent"
+	OperationAcquire                = "acquire"
+	OperationHeartbeat              = "heartbeat"
+	OperationRelease                = "release"
+	OperationAttachRetained         = "attach-retained"
+	OperationPrepareRetainedRemoval = "prepare-retained-removal"
+	OperationCommitRetainedRemoval  = "commit-retained-removal"
+	OperationAbortRetainedRemoval   = "abort-retained-removal"
+	OperationStatus                 = "status"
+	OperationAdmit                  = "admit"
+	OperationGC                     = "gc"
 )
 
 type Request struct {
@@ -59,6 +61,14 @@ type Lease struct {
 	VolumeGUID   string    `json:"volumeGuid,omitempty"`
 }
 
+type Removal struct {
+	TransactionID string     `json:"transactionId"`
+	RunID         string     `json:"runId"`
+	LeaseID       string     `json:"leaseId"`
+	State         string     `json:"state"`
+	ExpiresAt     *time.Time `json:"expiresAt,omitempty"`
+}
+
 type Metrics struct {
 	ParentStatus          string   `json:"parentStatus,omitempty"`
 	ParentCreated         bool     `json:"parentCreated"`
@@ -92,6 +102,7 @@ type Response struct {
 	Parent        *ParentMetadata `json:"parent,omitempty"`
 	ParentBuild   *ParentBuild    `json:"parentBuild,omitempty"`
 	Lease         *Lease          `json:"lease,omitempty"`
+	Removal       *Removal        `json:"removal,omitempty"`
 	Metrics       *Metrics        `json:"metrics,omitempty"`
 	Status        *Status         `json:"status,omitempty"`
 	Error         *Error          `json:"error,omitempty"`

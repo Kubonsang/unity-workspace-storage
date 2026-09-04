@@ -280,7 +280,7 @@ func (s *Store) WriteLease(journal LeaseJournal) error {
 	if err != nil {
 		return err
 	}
-	journal.SchemaVersion = ProtocolSchemaVersion
+	journal.SchemaVersion = LeaseJournalSchemaVersion
 	journal.UpdatedAt = s.now().UTC()
 	if journal.CreatedAt.IsZero() {
 		journal.CreatedAt = journal.UpdatedAt
@@ -297,7 +297,7 @@ func (s *Store) ReadLease(leaseID string) (*LeaseJournal, error) {
 	if err := readJSON(path, &journal); err != nil {
 		return nil, err
 	}
-	if journal.LeaseID != leaseID || journal.SchemaVersion != ProtocolSchemaVersion {
+	if journal.LeaseID != leaseID || journal.SchemaVersion != LeaseJournalSchemaVersion {
 		return nil, ErrOwnershipMismatch
 	}
 	return &journal, nil
@@ -407,7 +407,7 @@ func (s *Store) WriteRetained(journal LeaseJournal) error {
 	if err != nil {
 		return err
 	}
-	record := RetainedRecord{SchemaVersion: ProtocolSchemaVersion, RunID: journal.RunID, LeaseID: journal.LeaseID, OwnershipToken: journal.OwnershipToken, ParentKey: journal.ParentKey, ChildPath: journal.ChildPath, CreatedAt: s.now().UTC()}
+	record := RetainedRecord{SchemaVersion: RetainedRecordSchemaVersion, RunID: journal.RunID, LeaseID: journal.LeaseID, OwnershipToken: journal.OwnershipToken, ParentKey: journal.ParentKey, ChildPath: journal.ChildPath, CreatedAt: s.now().UTC()}
 	return writeJSONExclusive(path, record)
 }
 
@@ -420,7 +420,7 @@ func (s *Store) ReadRetained(runID string) (*RetainedRecord, error) {
 	if err := readJSON(path, &record); err != nil {
 		return nil, err
 	}
-	if record.SchemaVersion != ProtocolSchemaVersion || record.RunID != runID {
+	if record.SchemaVersion != RetainedRecordSchemaVersion || record.RunID != runID {
 		return nil, ErrOwnershipMismatch
 	}
 	return &record, nil
@@ -436,6 +436,45 @@ func (s *Store) RemoveRetained(record RetainedRecord) error {
 	}
 	path, _ := s.paths.RetainedRecord(record.RunID)
 	return os.Remove(path)
+}
+
+func (s *Store) WriteRemovalReceipt(receipt RemovalReceipt) error {
+	if !identifierPattern.MatchString(receipt.RunID) || !identifierPattern.MatchString(receipt.TransactionID) || !identifierPattern.MatchString(receipt.LeaseID) || strings.TrimSpace(receipt.OwnershipToken) == "" || !filepath.IsAbs(receipt.ChildPath) {
+		return ErrInvalidInput
+	}
+	path := filepath.Join(s.paths.Receipts, "removal-"+receipt.RunID+".json")
+	receipt.SchemaVersion = RemovalReceiptSchemaVersion
+	receipt.UpdatedAt = s.now().UTC()
+	if receipt.CreatedAt.IsZero() {
+		receipt.CreatedAt = receipt.UpdatedAt
+	}
+	return writeJSONDurable(path, receipt)
+}
+
+func (s *Store) ReadRemovalReceipt(runID string) (*RemovalReceipt, error) {
+	if !identifierPattern.MatchString(runID) {
+		return nil, ErrInvalidInput
+	}
+	path := filepath.Join(s.paths.Receipts, "removal-"+runID+".json")
+	var receipt RemovalReceipt
+	if err := readJSON(path, &receipt); err != nil {
+		return nil, err
+	}
+	if receipt.SchemaVersion != RemovalReceiptSchemaVersion || receipt.RunID != runID || !identifierPattern.MatchString(receipt.TransactionID) || !identifierPattern.MatchString(receipt.LeaseID) || strings.TrimSpace(receipt.OwnershipToken) == "" || !filepath.IsAbs(receipt.ChildPath) {
+		return nil, ErrOwnershipMismatch
+	}
+	return &receipt, nil
+}
+
+func (s *Store) RemoveRemovalReceipt(receipt RemovalReceipt) error {
+	actual, err := s.ReadRemovalReceipt(receipt.RunID)
+	if err != nil {
+		return err
+	}
+	if actual.TransactionID != receipt.TransactionID || actual.LeaseID != receipt.LeaseID || actual.OwnershipToken != receipt.OwnershipToken || !samePath(actual.ChildPath, receipt.ChildPath) {
+		return ErrOwnershipMismatch
+	}
+	return os.Remove(filepath.Join(s.paths.Receipts, "removal-"+receipt.RunID+".json"))
 }
 
 func (s *Store) ListParents() ([]ParentMetadata, error) {

@@ -36,6 +36,9 @@ const (
 	getVirtualDiskInfoSize           = 1
 	getVirtualDiskInfoParentLocation = 3
 	getVirtualDiskInfoVirtualDiskID  = 14
+	fsctlLockVolume                  = 0x00090018
+	fsctlUnlockVolume                = 0x0009001c
+	fsctlDismountVolume              = 0x00090020
 )
 
 var (
@@ -703,6 +706,108 @@ func (a *Attachment) Close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+type volumeRemovalLock struct {
+	handle       windows.Handle
+	volumeGUID   string
+	mountPath    string
+	dismounted   bool
+	mountRemoved bool
+	closed       bool
+}
+
+func (a *Attachment) lockForRemoval(ctx context.Context) (*volumeRemovalLock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, newError(CodeCancelled, "lock-volume", a.volumeGUIDPath, err)
+	}
+	if !a.mounted || strings.TrimSpace(a.volumeGUIDPath) == "" || strings.TrimSpace(a.mountPath) == "" {
+		return nil, newError(CodeCleanupFailed, "lock-volume", a.path, fmt.Errorf("mounted volume identity is unavailable"))
+	}
+	if err := verifyVolumeMountTarget(a.mountPath, a.volumeGUIDPath); err != nil {
+		return nil, err
+	}
+	volume, err := windows.UTF16PtrFromString(strings.TrimSuffix(a.volumeGUIDPath, `\`))
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateFile(volume, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return nil, newError(CodeVolumeInUse, "open-volume-for-lock", a.volumeGUIDPath, err)
+	}
+	var returned uint32
+	if err := windows.DeviceIoControl(handle, fsctlLockVolume, nil, 0, nil, 0, &returned, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		return nil, newError(CodeVolumeInUse, "FSCTL_LOCK_VOLUME", a.volumeGUIDPath, err)
+	}
+	return &volumeRemovalLock{handle: handle, volumeGUID: a.volumeGUIDPath, mountPath: a.mountPath}, nil
+}
+
+func verifyVolumeMountTarget(mountPath, expectedVolumeGUID string) error {
+	mount, err := windows.UTF16PtrFromString(ensureTrailingSeparator(mountPath))
+	if err != nil {
+		return err
+	}
+	buffer := make([]uint16, 1024)
+	ok, _, callErr := procGetVolumeNameForMountPoint.Call(uintptr(unsafe.Pointer(mount)), uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
+	if ok == 0 {
+		return newError(CodeMountOwnershipLost, "resolve-mounted-volume", mountPath, callErr)
+	}
+	actual := windows.UTF16ToString(buffer)
+	if !sameVolumeGUID(actual, expectedVolumeGUID) {
+		return newError(CodeMountOwnershipLost, "validate-mounted-volume", mountPath, fmt.Errorf("target=%q expected=%q", actual, expectedVolumeGUID))
+	}
+	return nil
+}
+
+func (lock *volumeRemovalLock) abort() error {
+	if lock == nil || lock.closed {
+		return nil
+	}
+	var returned uint32
+	unlockErr := windows.DeviceIoControl(lock.handle, fsctlUnlockVolume, nil, 0, nil, 0, &returned, nil)
+	closeErr := windows.CloseHandle(lock.handle)
+	lock.handle = 0
+	lock.closed = true
+	return errors.Join(unlockErr, closeErr)
+}
+
+func (lock *volumeRemovalLock) close() error {
+	if lock == nil || lock.closed {
+		return nil
+	}
+	err := windows.CloseHandle(lock.handle)
+	lock.handle = 0
+	lock.closed = true
+	return err
+}
+
+func (lock *volumeRemovalLock) dismountAndRemoveMount(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !lock.dismounted {
+		if err := windows.FlushFileBuffers(lock.handle); err != nil {
+			return newError(CodeCleanupFailed, "FlushFileBuffers", lock.volumeGUID, err)
+		}
+		var returned uint32
+		if err := windows.DeviceIoControl(lock.handle, fsctlDismountVolume, nil, 0, nil, 0, &returned, nil); err != nil {
+			return newError(CodeUnmountFailed, "FSCTL_DISMOUNT_VOLUME", lock.volumeGUID, err)
+		}
+		lock.dismounted = true
+	}
+	if !lock.mountRemoved {
+		mount, err := windows.UTF16PtrFromString(ensureTrailingSeparator(lock.mountPath))
+		if err != nil {
+			return err
+		}
+		ok, _, callErr := procDeleteVolumeMountPoint.Call(uintptr(unsafe.Pointer(mount)))
+		if ok == 0 {
+			return newError(CodeUnmountFailed, "DeleteVolumeMountPoint", lock.mountPath, callErr)
+		}
+		lock.mountRemoved = true
+	}
+	return nil
+}
+
 func appendIf(values []error, err error) []error {
 	if err != nil {
 		return append(values, err)
@@ -1118,9 +1223,125 @@ type windowsLease struct {
 	mountCreated bool
 	released     bool
 	metrics      Metrics
+	removal      *windowsRemovalReservation
 }
 
 func (l *windowsLease) Info() LeaseInfo { return l.info }
+
+type windowsRemovalReservation struct {
+	mu         sync.Mutex
+	lease      *windowsLease
+	lock       *volumeRemovalLock
+	committing bool
+	committed  bool
+	aborted    bool
+	metrics    Metrics
+}
+
+func (l *windowsLease) PrepareRemoval(ctx context.Context) (RemovalReservation, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return nil, newError(CodeCleanupFailed, "prepare-removal", l.info.ChildPath, fmt.Errorf("lease is already released"))
+	}
+	if l.removal != nil {
+		return nil, newError(CodeVolumeInUse, "prepare-removal", l.info.MountPath, fmt.Errorf("removal is already prepared"))
+	}
+	lock, err := l.attachment.lockForRemoval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reservation := &windowsRemovalReservation{lease: l, lock: lock}
+	l.removal = reservation
+	return reservation, nil
+}
+
+func (reservation *windowsRemovalReservation) Abort() error {
+	reservation.mu.Lock()
+	defer reservation.mu.Unlock()
+	if reservation.committed || reservation.aborted {
+		return nil
+	}
+	if reservation.committing {
+		return newError(CodeCleanupFailed, "abort-removal", reservation.lease.info.ChildPath, fmt.Errorf("removal commit already started"))
+	}
+	err := reservation.lock.abort()
+	reservation.aborted = true
+	reservation.lease.mu.Lock()
+	if reservation.lease.removal == reservation {
+		reservation.lease.removal = nil
+	}
+	reservation.lease.mu.Unlock()
+	return err
+}
+
+func (reservation *windowsRemovalReservation) Commit(ctx context.Context, progress ProgressFunc) (Metrics, error) {
+	reservation.mu.Lock()
+	defer reservation.mu.Unlock()
+	if reservation.committed {
+		return reservation.metrics, nil
+	}
+	if reservation.aborted {
+		return Metrics{}, newError(CodeCleanupFailed, "commit-removal", reservation.lease.info.ChildPath, fmt.Errorf("removal was aborted"))
+	}
+	reservation.committing = true
+	l := reservation.lease
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	started := time.Now()
+	metrics := reservation.metrics
+	if err := notify(progress, Progress{State: StateUnmounting, PhysicalPath: l.info.PhysicalPath, VolumeGUIDPath: l.info.VolumeGUIDPath}); err != nil {
+		return metrics, err
+	}
+	phase := time.Now()
+	if err := reservation.lock.dismountAndRemoveMount(ctx); err != nil {
+		return metrics, err
+	}
+	l.attachment.mounted = false
+	metrics.UnmountCallMs = milliseconds(time.Since(phase).Milliseconds())
+	if err := notify(progress, Progress{State: StateDetaching, PhysicalPath: l.info.PhysicalPath, VolumeGUIDPath: l.info.VolumeGUIDPath}); err != nil {
+		return metrics, err
+	}
+	phase = time.Now()
+	if err := l.attachment.Detach(); err != nil {
+		return metrics, err
+	}
+	metrics.DetachCallMs = milliseconds(time.Since(phase).Milliseconds())
+	if err := l.attachment.CloseHandle(); err != nil {
+		return metrics, newError(CodeCleanupFailed, "close-handle", l.info.ChildPath, err)
+	}
+	wait, bootstrap, err := l.attachment.WaitDetached(ctx)
+	if err != nil {
+		return metrics, err
+	}
+	metrics.DetachVisibilityWaitMs = milliseconds(wait)
+	metrics.PowerShellBootstrapMs = milliseconds(bootstrap)
+	if err := reservation.lock.close(); err != nil {
+		return metrics, newError(CodeCleanupFailed, "close-volume-lock", l.info.VolumeGUIDPath, err)
+	}
+	metrics.ChildReleasedLogicalBytes, _ = logicalFileSize(l.info.ChildPath)
+	metrics.ChildReleasedAllocatedBytes, _ = allocatedFileSize(l.info.ChildPath)
+	cleanup := time.Now()
+	if err := os.Remove(l.info.ChildPath); err != nil && !os.IsNotExist(err) {
+		return metrics, newError(CodeCleanupFailed, "remove-child", l.info.ChildPath, err)
+	}
+	if l.mountCreated {
+		if err := os.Remove(l.info.MountPath); err != nil && !os.IsNotExist(err) {
+			return metrics, newError(CodeCleanupFailed, "remove-mount-path", l.info.MountPath, err)
+		}
+	}
+	metrics.CleanupMs = milliseconds(time.Since(cleanup).Milliseconds())
+	metrics.ReleaseWallClockMs = milliseconds(time.Since(started).Milliseconds())
+	metrics.TotalWallClockMs = metrics.ReleaseWallClockMs
+	if err := notify(progress, Progress{State: StateReleased, PhysicalPath: l.info.PhysicalPath, VolumeGUIDPath: l.info.VolumeGUIDPath}); err != nil {
+		return metrics, err
+	}
+	l.released = true
+	l.metrics = metrics
+	reservation.metrics = metrics
+	reservation.committed = true
+	return metrics, nil
+}
 func (l *windowsLease) Release(ctx context.Context, deleteChild bool, progress ProgressFunc) (Metrics, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

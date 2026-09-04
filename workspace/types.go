@@ -7,16 +7,19 @@ import (
 )
 
 const (
-	Provider                    = "vhdx-differencing"
-	ParentSchemaVersion         = 2
-	ProtocolSchemaVersion       = 2
-	DefaultVirtualBytes   int64 = 64 << 30
-	DefaultBlockBytes     int64 = 2 << 20
-	DefaultSectorBytes    int64 = 4 << 10
-	DefaultQuotaBytes     int64 = 32 << 30
-	DefaultHostFloor      int64 = 20 << 30
-	DefaultChildReserve   int64 = 2 << 30
-	SafetyHostFloor       int64 = 5 << 30
+	Provider                          = "vhdx-differencing"
+	ParentSchemaVersion               = 2
+	ProtocolSchemaVersion             = 3
+	LeaseJournalSchemaVersion         = 2
+	RetainedRecordSchemaVersion       = 2
+	RemovalReceiptSchemaVersion       = 1
+	DefaultVirtualBytes         int64 = 64 << 30
+	DefaultBlockBytes           int64 = 2 << 20
+	DefaultSectorBytes          int64 = 4 << 10
+	DefaultQuotaBytes           int64 = 32 << 30
+	DefaultHostFloor            int64 = 20 << 30
+	DefaultChildReserve         int64 = 2 << 30
+	SafetyHostFloor             int64 = 5 << 30
 )
 
 const WorkspaceOwnerSchemaVersion = 1
@@ -42,6 +45,7 @@ var (
 	ErrStorageUnavailable = errors.New("storage capacity unavailable")
 	ErrOwnershipMismatch  = errors.New("workspace ownership mismatch")
 	ErrBrokerUnavailable  = errors.New("storage broker unavailable")
+	ErrVolumeInUse        = errors.New("workspace volume is in use")
 )
 
 type Error struct {
@@ -161,6 +165,18 @@ type RetainedRecord struct {
 	ParentKey      string    `json:"parentKey"`
 	ChildPath      string    `json:"childPath"`
 	CreatedAt      time.Time `json:"createdAt"`
+}
+
+type RemovalReceipt struct {
+	SchemaVersion  int       `json:"schemaVersion"`
+	TransactionID  string    `json:"transactionId"`
+	RunID          string    `json:"runId"`
+	LeaseID        string    `json:"leaseId"`
+	OwnershipToken string    `json:"ownershipToken"`
+	ChildPath      string    `json:"childPath"`
+	State          string    `json:"state"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type Capacity struct {
