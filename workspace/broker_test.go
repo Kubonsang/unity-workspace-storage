@@ -890,6 +890,52 @@ func TestAdmissionEnforcesHostFreeFloorAndChildReserve(t *testing.T) {
 	}
 }
 
+func TestParentCommitRequiresChildReserveAndRemainsAbortable(t *testing.T) {
+	broker, key, workspaces := testBroker(t, &fakeNative{})
+	if err := os.Mkdir(filepath.Join(workspaces, "builder-no-reserve"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	begin := request(OperationBeginParentBuild, "begin-parent-no-reserve")
+	begin.ParentKey = &key
+	begin.Source = &SourceSnapshot{}
+	begin.WorkspaceID = "builder-no-reserve"
+	started := broker.Handle(context.Background(), "S-1-5-21-test", begin)
+	if !started.OK || started.ParentBuild == nil {
+		t.Fatalf("begin=%+v", started)
+	}
+	allocated, err := fileAllocatedBytes(broker.pending[started.ParentBuild.TransactionID].StagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.config.QuotaBytes = allocated
+
+	commit := request(OperationCommitParent, "commit-parent-no-reserve")
+	commit.TransactionID = started.ParentBuild.TransactionID
+	committed := broker.Handle(context.Background(), "S-1-5-21-test", commit)
+	if committed.OK || committed.Error == nil || committed.Error.Code != "storage-capacity-unavailable" || committed.Error.Operation != "commit-parent-capacity" {
+		t.Fatalf("commit=%+v", committed)
+	}
+	resolved, resolveErr := broker.store.ResolveParent(key)
+	if resolveErr != nil || resolved.Status != ParentStatusMissing {
+		t.Fatalf("resolved=%+v err=%v", resolved, resolveErr)
+	}
+	pending, pendingErr := broker.store.ReadPending(key.Digest)
+	if pendingErr != nil || pending.TransactionID != started.ParentBuild.TransactionID {
+		t.Fatalf("pending=%+v err=%v", pending, pendingErr)
+	}
+
+	abort := request(OperationAbortParent, "abort-parent-no-reserve")
+	abort.TransactionID = started.ParentBuild.TransactionID
+	aborted := broker.Handle(context.Background(), "S-1-5-21-test", abort)
+	if !aborted.OK {
+		t.Fatalf("abort=%+v", aborted)
+	}
+	resolved, resolveErr = broker.store.ResolveParent(key)
+	if resolveErr != nil || resolved.Status != ParentStatusMissing {
+		t.Fatalf("resolved after abort=%+v err=%v", resolved, resolveErr)
+	}
+}
+
 func TestConcurrentParentCreationHasSingleBuilder(t *testing.T) {
 	native := &fakeNative{}
 	broker, key, workspaces := testBroker(t, native)

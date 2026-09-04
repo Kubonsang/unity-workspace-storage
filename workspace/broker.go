@@ -391,6 +391,12 @@ func (b *Broker) commitParent(ctx context.Context, request Request, fail failure
 	if err != nil {
 		return fail("parent-verification-failed", "finalize-parent", pending.StagingPath, err)
 	}
+	// Do not publish a cache that leaves no room for its first differencing
+	// child. The finalized transaction remains pending so the client can abort
+	// it safely when admission fails.
+	if _, err := b.ensureCapacity(1, false); err != nil {
+		return fail("storage-capacity-unavailable", "commit-parent-capacity", pending.StagingPath, err)
+	}
 	metadata := ParentMetadata{
 		CompatibilityKey: pending.Key, SourceSnapshot: pending.Source, OwnershipToken: pending.OwnershipToken,
 		FileIdentity: evidence.FileIdentity, Volume: evidence.Volume,
