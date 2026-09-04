@@ -11,7 +11,7 @@ func TestDefaultServiceIdentityIsProductNeutralAndDoesNotCollideWithLegacyTestPl
 	if WindowsServiceName != "UnityWorkspaceStorage" {
 		t.Fatalf("unexpected service name %q", WindowsServiceName)
 	}
-	if DefaultPipeName != `\\.\pipe\unity-workspace-storage-v3` {
+	if DefaultPipeName != `\\.\pipe\unity-workspace-storage-v2` {
 		t.Fatalf("unexpected default pipe %q", DefaultPipeName)
 	}
 	if WindowsServiceName == legacyService || DefaultPipeName == legacyPipe {
