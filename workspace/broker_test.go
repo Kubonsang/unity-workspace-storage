@@ -14,18 +14,19 @@ import (
 )
 
 type fakeNative struct {
-	mu          sync.Mutex
-	events      []string
-	hostFree    int64
-	acquiring   int
-	maxAcquire  int
-	acquireGate chan struct{}
-	verifyErr   error
-	attachErr   error
-	bootSession string
-	livePIDs    map[int]bool
-	attachCalls int
-	prepareErr  error
+	mu                     sync.Mutex
+	events                 []string
+	hostFree               int64
+	acquiring              int
+	maxAcquire             int
+	acquireGate            chan struct{}
+	verifyErr              error
+	attachErr              error
+	bootSession            string
+	livePIDs               map[int]bool
+	attachCalls            int
+	prepareErr             error
+	beforeAttachCheckpoint func()
 }
 
 func (native *fakeNative) event(value string) {
@@ -83,9 +84,10 @@ func (native *fakeNative) AcquireChild(_ context.Context, parent ParentMetadata,
 	lease := Lease{LeaseID: journal.LeaseID, RunID: journal.RunID, ParentKey: parent.CompatibilityKey.Digest, MountPath: journal.MountPath, State: "ready", CreatedAt: time.Now(), PhysicalPath: `\\.\PhysicalDrive99`, VolumeGUID: `\\?\Volume{fake}\`}
 	return &fakeChildSession{lease: lease, childPath: journal.ChildPath, identity: FileIdentity{FileID: "fake:" + journal.LeaseID}}, Metrics{ChildCreateMs: 1, ChildAttachMs: 2, ChildMountMs: 3, ChildReadyBytes: 5}, nil
 }
-func (native *fakeNative) AttachChild(_ context.Context, parent ParentMetadata, journal LeaseJournal) (ChildSession, Metrics, error) {
+func (native *fakeNative) AttachChild(_ context.Context, parent ParentMetadata, journal LeaseJournal, transition func(string, string, string) error) (ChildSession, Metrics, error) {
 	native.mu.Lock()
 	native.attachCalls++
+	attachNumber := native.attachCalls
 	native.mu.Unlock()
 	if native.attachErr != nil {
 		return nil, Metrics{}, native.attachErr
@@ -96,7 +98,17 @@ func (native *fakeNative) AttachChild(_ context.Context, parent ParentMetadata, 
 	if err := os.Mkdir(journal.MountPath, 0700); err != nil && !os.IsExist(err) {
 		return nil, Metrics{}, err
 	}
-	lease := Lease{LeaseID: journal.LeaseID, RunID: journal.RunID, ParentKey: parent.CompatibilityKey.Digest, MountPath: journal.MountPath, State: "ready", CreatedAt: journal.CreatedAt, Retained: true}
+	volume := fmt.Sprintf(`\\?\Volume{reattached-%d}\`, attachNumber)
+	physical := `\\.\PhysicalDrive100`
+	if native.beforeAttachCheckpoint != nil {
+		native.beforeAttachCheckpoint()
+	}
+	if transition != nil {
+		if err := transition("mounting", physical, volume); err != nil {
+			return nil, Metrics{}, err
+		}
+	}
+	lease := Lease{LeaseID: journal.LeaseID, RunID: journal.RunID, ParentKey: parent.CompatibilityKey.Digest, MountPath: journal.MountPath, State: "ready", CreatedAt: journal.CreatedAt, Retained: true, VolumeGUID: volume, PhysicalPath: physical}
 	return &fakeChildSession{lease: lease, childPath: journal.ChildPath, identity: journal.FileIdentity, prepareErr: native.prepareErr}, Metrics{ChildAttachMs: 1, ChildMountMs: 1}, nil
 }
 

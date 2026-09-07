@@ -408,7 +408,22 @@ func (s *Store) WriteRetained(journal LeaseJournal) error {
 		return err
 	}
 	record := RetainedRecord{SchemaVersion: RetainedRecordSchemaVersion, RunID: journal.RunID, LeaseID: journal.LeaseID, OwnershipToken: journal.OwnershipToken, ParentKey: journal.ParentKey, ChildPath: journal.ChildPath, CreatedAt: s.now().UTC()}
-	return writeJSONExclusive(path, record)
+	err = writeJSONExclusive(path, record)
+	if !os.IsExist(err) {
+		return err
+	}
+	// Releasing an already retained child after repair is idempotent, but an
+	// existing record for any other owner must never be replaced.
+	actual, readErr := s.ReadRetained(journal.RunID)
+	if readErr != nil {
+		return readErr
+	}
+	if actual.LeaseID != record.LeaseID || actual.RunID != record.RunID ||
+		actual.OwnershipToken != record.OwnershipToken || actual.ParentKey != record.ParentKey ||
+		!samePath(actual.ChildPath, record.ChildPath) {
+		return ErrOwnershipMismatch
+	}
+	return nil
 }
 
 func (s *Store) ReadRetained(runID string) (*RetainedRecord, error) {

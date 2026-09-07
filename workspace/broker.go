@@ -33,6 +33,7 @@ type Broker struct {
 	requests map[string]Response
 	inflight map[string]chan struct{}
 	removals map[string]*retainedRemoval
+	busyRuns map[string]bool
 	now      func() time.Time
 }
 
@@ -113,7 +114,7 @@ func (b *Broker) Recover(ctx context.Context, grace time.Duration) (RecoverySumm
 				return summary, writeErr
 			}
 			var attachErr error
-			session, _, attachErr = b.native.AttachChild(ctx, *resolved.Metadata, journal)
+			session, _, attachErr = b.attachRecorded(ctx, *resolved.Metadata, &journal)
 			if attachErr != nil {
 				journal.State = "quarantined"
 				journal.RecoveryError = attachErr.Error()
@@ -217,6 +218,9 @@ func (b *Broker) Handle(ctx context.Context, callerSID string, request Request) 
 
 func (b *Broker) handleLocked(ctx context.Context, callerSID string, request Request) Response {
 	fail := func(code, operation, path string, err error) Response {
+		if errors.Is(err, ErrRetainedMountIdentityMismatch) {
+			code = "retained-mount-identity-mismatch"
+		}
 		return Response{SchemaVersion: ProtocolSchemaVersion, RequestID: request.RequestID, OK: false, Error: &Error{Code: code, Operation: operation, Path: path, Message: errorText(err), Cause: err}}
 	}
 	if request.SchemaVersion != ProtocolSchemaVersion {
@@ -244,6 +248,31 @@ func (b *Broker) handleLocked(ctx context.Context, callerSID string, request Req
 		if err := b.store.EnsureLayout(); err != nil {
 			return fail("store-invalid", "ensure-layout", b.config.StoreRoot, err)
 		}
+	}
+	// A read-only identity probe and its following repair/removal must not
+	// race another request for the same retained child. Different Workspaces
+	// remain independent.
+	runID := ""
+	switch request.Operation {
+	case OperationAttachRetained, OperationPrepareRetainedRemoval, OperationCommitRetainedRemoval, OperationAbortRetainedRemoval:
+		runID = request.RunID
+	case OperationRelease, OperationHeartbeat:
+		if journal, err := b.store.ReadLease(request.LeaseID); err == nil {
+			runID = journal.RunID
+		}
+	}
+	if runID != "" {
+		b.mu.Lock()
+		if b.busyRuns == nil {
+			b.busyRuns = make(map[string]bool)
+		}
+		if b.busyRuns[runID] {
+			b.mu.Unlock()
+			return fail("lease-conflict", "reserve-retained-operation", runID, ErrParentConflict)
+		}
+		b.busyRuns[runID] = true
+		b.mu.Unlock()
+		defer func() { b.mu.Lock(); delete(b.busyRuns, runID); b.mu.Unlock() }()
 	}
 	switch request.Operation {
 	case OperationHello:
@@ -313,14 +342,10 @@ func (b *Broker) attachRetained(ctx context.Context, request Request, fail failu
 		return fail("invalid-workspace", "validate-retained-mount", mount, err)
 	}
 	journal.MountPath = mount
-	session, metrics, err := b.native.AttachChild(ctx, *resolved.Metadata, *journal)
+	journal.ClientPID = request.ClientPID
+	session, metrics, err := b.attachRecorded(ctx, *resolved.Metadata, journal)
 	if err != nil {
 		return fail("retained-attach-failed", "attach-retained", record.ChildPath, err)
-	}
-	journal.State = "ready"
-	if err := b.store.WriteLease(*journal); err != nil {
-		_, cleanupErr := session.Release(context.Background(), false)
-		return fail("journal-write-failed", "attach-retained", record.ChildPath, errors.Join(err, cleanupErr))
 	}
 	b.mu.Lock()
 	b.children[record.LeaseID] = session
