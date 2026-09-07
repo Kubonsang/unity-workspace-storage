@@ -15,7 +15,7 @@ $overlayManifestPath = if ([string]::IsNullOrWhiteSpace($OverlayManifest)) {
     [IO.Path]::GetFullPath($OverlayManifest)
 }
 $expectedFrozenFileCount = 42
-$expectedOverlayFileCount = 5
+$expectedOverlayFileCount = 20
 $failures = [Collections.Generic.List[string]]::new()
 $checked = 0
 $sha256 = [Security.Cryptography.SHA256]::Create()

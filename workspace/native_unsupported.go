@@ -23,7 +23,7 @@ func (unsupportedNative) VerifyParent(context.Context, ParentMetadata) error {
 func (unsupportedNative) AcquireChild(context.Context, ParentMetadata, LeaseJournal, func(string, string, string) error) (ChildSession, Metrics, error) {
 	return nil, Metrics{}, fmt.Errorf("%w: Windows is required", ErrBrokerUnavailable)
 }
-func (unsupportedNative) AttachChild(context.Context, ParentMetadata, LeaseJournal) (ChildSession, Metrics, error) {
+func (unsupportedNative) AttachChild(context.Context, ParentMetadata, LeaseJournal, func(string, string, string) error) (ChildSession, Metrics, error) {
 	return nil, Metrics{}, fmt.Errorf("%w: Windows is required", ErrBrokerUnavailable)
 }
 func (unsupportedNative) BootSessionID() string { return "" }

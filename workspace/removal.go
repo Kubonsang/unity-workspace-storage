@@ -225,7 +225,7 @@ func (b *Broker) retainedSession(ctx context.Context, request Request, record Re
 		return nil, fail("invalid-workspace", "validate-retained-mount", mount, err)
 	}
 	journal.MountPath = mount
-	session, _, err = b.native.AttachChild(ctx, *resolved.Metadata, journal)
+	session, _, err = b.attachRecorded(ctx, *resolved.Metadata, &journal)
 	if err != nil {
 		return nil, fail("retained-attach-failed", "prepare-retained-removal", record.ChildPath, err)
 	}

@@ -1197,6 +1197,9 @@ func AttachExisting(ctx context.Context, request AcquireRequest, progress Progre
 	metrics.PnPDiscoveryWaitMs = milliseconds(volume.PnPDiscoveryWaitMs)
 	metrics.VolumeReadyWaitMs = milliseconds(volume.VolumeReadyWaitMs)
 	metrics.PowerShellBootstrapMs = milliseconds(bootstrap)
+	if err := notify(progress, Progress{State: StateMounting, PhysicalPath: physicalPath, VolumeGUIDPath: volume.VolumeGUIDPath}); err != nil {
+		return fail(err)
+	}
 	mount, bootstrap, err := attachment.Mount(ctx, request.MountPath, false)
 	if err != nil {
 		return fail(err)

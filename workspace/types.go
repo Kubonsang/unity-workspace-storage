@@ -40,12 +40,13 @@ const (
 )
 
 var (
-	ErrInvalidInput       = errors.New("invalid vhdx workspace input")
-	ErrParentConflict     = errors.New("parent transaction conflict")
-	ErrStorageUnavailable = errors.New("storage capacity unavailable")
-	ErrOwnershipMismatch  = errors.New("workspace ownership mismatch")
-	ErrBrokerUnavailable  = errors.New("storage broker unavailable")
-	ErrVolumeInUse        = errors.New("workspace volume is in use")
+	ErrInvalidInput                  = errors.New("invalid vhdx workspace input")
+	ErrParentConflict                = errors.New("parent transaction conflict")
+	ErrStorageUnavailable            = errors.New("storage capacity unavailable")
+	ErrOwnershipMismatch             = errors.New("workspace ownership mismatch")
+	ErrRetainedMountIdentityMismatch = errors.New("retained mount identity mismatch")
+	ErrBrokerUnavailable             = errors.New("storage broker unavailable")
+	ErrVolumeInUse                   = errors.New("workspace volume is in use")
 )
 
 type Error struct {

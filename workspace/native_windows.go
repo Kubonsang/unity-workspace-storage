@@ -379,7 +379,7 @@ func (native windowsNative) AcquireChild(ctx context.Context, parent ParentMetad
 	}, backend: lease, path: journal.ChildPath, identity: FileIdentity{FileID: identity}}, metrics, nil
 }
 
-func (native windowsNative) AttachChild(ctx context.Context, parent ParentMetadata, journal LeaseJournal) (ChildSession, Metrics, error) {
+func (native windowsNative) AttachChild(ctx context.Context, parent ParentMetadata, journal LeaseJournal, transition func(string, string, string) error) (ChildSession, Metrics, error) {
 	identity, err := storage.FileIdentity(journal.ChildPath)
 	if err != nil {
 		return nil, Metrics{}, err
@@ -388,10 +388,20 @@ func (native windowsNative) AttachChild(ctx context.Context, parent ParentMetada
 	if actual != journal.FileIdentity {
 		return nil, Metrics{}, ErrOwnershipMismatch
 	}
-	if _, err := storage.PrepareDetachedStaleMount(ctx, journal.ChildPath, journal.MountPath, journal.VolumeGUID); err != nil {
+	if _, err := storage.PrepareRetainedStaleMount(ctx, journal.ChildPath, parent.VHDXPath, journal.MountPath, journal.VolumeGUID, journal.FileIdentity.FileID); err != nil {
+		var cause *storage.Error
+		if errors.As(err, &cause) && cause.Operation == "validate-stale-mount-target" {
+			return nil, Metrics{}, errors.Join(ErrRetainedMountIdentityMismatch, err)
+		}
 		return nil, Metrics{}, err
 	}
-	lease, raw, err := storage.AttachExisting(ctx, storage.AcquireRequest{ParentPath: parent.VHDXPath, ChildPath: journal.ChildPath, MountPath: journal.MountPath, StoreRoot: filepath.Dir(filepath.Dir(journal.ChildPath)), LeaseID: journal.LeaseID, UserSID: journal.UserSID}, nil)
+	progress := func(p storage.Progress) error {
+		if transition != nil && (p.State == storage.StateMounting || p.State == storage.StateReady) {
+			return transition(string(p.State), p.PhysicalPath, p.VolumeGUIDPath)
+		}
+		return nil
+	}
+	lease, raw, err := storage.AttachExisting(ctx, storage.AcquireRequest{ParentPath: parent.VHDXPath, ChildPath: journal.ChildPath, MountPath: journal.MountPath, StoreRoot: filepath.Dir(filepath.Dir(journal.ChildPath)), LeaseID: journal.LeaseID, UserSID: journal.UserSID}, progress)
 	metrics := Metrics{ParentStatus: ParentStatusValid, ParentReused: true, ParentVirtualBytes: parent.VirtualBytes, ParentAllocatedBytes: parent.AllocatedBytes}
 	if raw.AttachCallMs != nil {
 		metrics.ChildAttachMs = *raw.AttachCallMs
