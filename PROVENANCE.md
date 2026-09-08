@@ -1,5 +1,25 @@
 # Extraction provenance
 
+## HoneyBee child geometry follow-up (2026-09-08)
+
+Runtime change `c238f283ded29f716f72e7d556cfeef3efd98639` explicitly selects
+1 MiB blocks for newly created Windows differencing children. Existing 2 MiB
+parents and retained children keep their geometry. The normalized hashes for
+`storage/lifecycle.go` and `storage/lifecycle_windows.go` are updated only in
+the destination overlay; the frozen extraction manifests remain unchanged.
+The additive native geometry test is not a checkpoint-derived file.
+
+HoneyBee's GNF experiment (three fresh children per geometry, two Unity sessions
+each) measured median final allocation of 940,572,672 versus 763,363,328 bytes
+(18.84% less), without a timing regression against its pre-registered gate.
+Verification used read-only mounts after measurement. Offline compaction
+reclaimed zero bytes on both disposable copies. These results cover one project
+and host; they do not establish universal savings or long-term growth.
+
+The hb10 runtime identifier remains `0.0.0+c238f283ded2.hb10`. A subsequent
+provenance-only source pin records these overlay hashes without changing runtime
+Go source or the compiled broker payload.
+
 ## Source identity
 
 - source repository: `github.com/Kubonsang/testplay-runner`
