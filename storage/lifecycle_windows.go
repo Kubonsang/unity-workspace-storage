@@ -359,7 +359,10 @@ func CreateDynamicWithOptions(path string, options CreateOptions) error {
 }
 
 func CreateDifferencing(path, parentPath string) error {
-	return createVHDX(path, CreateOptions{}, parentPath)
+	// Specify the child geometry explicitly. Windows creates a 2 MiB child
+	// when zero is supplied, even when the parent's blocks are 1 MiB.
+	// Existing parents and retained children keep their recorded geometry.
+	return createVHDX(path, CreateOptions{BlockSizeInBytes: 1 << 20}, parentPath)
 }
 
 func createVHDX(path string, options CreateOptions, parentPath string) error {

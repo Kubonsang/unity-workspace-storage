@@ -15,8 +15,8 @@ const (
 	ProviderReflink = "linux-reflink"
 )
 
-// CreateOptions fixes the parent disk geometry that all differencing children
-// inherit. Zero geometry fields retain the platform default for legacy callers.
+// CreateOptions controls dynamic disk geometry. A differencing child's payload
+// block size is chosen independently; zero fields select the Windows default.
 type CreateOptions struct {
 	MaximumSize       int64
 	BlockSizeInBytes  uint32
